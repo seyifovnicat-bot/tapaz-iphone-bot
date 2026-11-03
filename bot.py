@@ -4,7 +4,7 @@ import time
 import logging
 import sqlite3
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urljoin
 import requests
@@ -14,16 +14,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Loq konfiqurasiyası
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger("TapAzBot")
 
+# Bakı Saat Qurşağı (UTC+4)
+BAKU_TZ = timezone(timedelta(hours=4))
+
+def get_baku_now():
+    """Dəqiq Bakı vaxtını qaytarır (UTC+4)"""
+    return datetime.now(BAKU_TZ)
+
 # Telegram & Admin konfiqurasiyası
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8873977210:AAGayQLy11TeRvM-42ZTd_H254FbywjBtB4")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7998954235"))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60")) # 60 saniyə (təhlükəsiz və bloklanmayan interval)
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60")) # 60 saniyə (təhlükəsiz Bakı vaxtı ilə)
 PORT = int(os.getenv("PORT", "10000"))
 
 TAPAZ_APPLE_URL = "https://tap.az/elanlar/elektronika/telefonlar?p%5B749%5D=3855"
@@ -97,23 +105,24 @@ def mark_ad_seen(ad_id, model="", title="", price=""):
     conn.close()
 
 def register_pending_user(user_id, username, full_name):
-    """Yeni istifadəçini təsdiq gözləyən kimi qeyd edir"""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
+    now_baku = get_baku_now().strftime("%Y-%m-%d %H:%M:%S")
     cur.execute("""
         INSERT INTO users (user_id, username, full_name, plan_name, expires_at, is_active)
-        VALUES (?, ?, ?, 'Təsdiq Gözləyir', datetime('now'), 0)
+        VALUES (?, ?, ?, 'Təsdiq Gözləyir', ?, 0)
         ON CONFLICT(user_id) DO UPDATE SET
             username=excluded.username,
             full_name=excluded.full_name
-    """, (user_id, username or "", full_name or ""))
+    """, (user_id, username or "", full_name or "", now_baku))
     conn.commit()
     conn.close()
 
 def add_or_update_user(user_id, username, full_name, plan_name, days=3, is_active=1):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    expires_at = datetime.now() + timedelta(days=days)
+    expires_at = get_baku_now() + timedelta(days=days)
+    exp_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
     cur.execute("""
         INSERT INTO users (user_id, username, full_name, plan_name, expires_at, is_active)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -123,7 +132,7 @@ def add_or_update_user(user_id, username, full_name, plan_name, days=3, is_activ
             plan_name=excluded.plan_name,
             expires_at=excluded.expires_at,
             is_active=excluded.is_active
-    """, (user_id, username or "", full_name or "", plan_name, expires_at.strftime("%Y-%m-%d %H:%M:%S"), is_active))
+    """, (user_id, username or "", full_name or "", plan_name, exp_str, is_active))
     conn.commit()
     conn.close()
     return expires_at
@@ -139,10 +148,11 @@ def get_user(user_id):
 def get_active_subscribers():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
+    baku_now_str = get_baku_now().strftime("%Y-%m-%d %H:%M:%S")
     cur.execute("""
         SELECT user_id FROM users 
-        WHERE is_active = 1 AND datetime(expires_at) > datetime('now')
-    """)
+        WHERE is_active = 1 AND expires_at > ?
+    """, (baku_now_str,))
     rows = cur.fetchall()
     conn.close()
     return [r[0] for r in rows]
@@ -221,7 +231,7 @@ def send_telegram_photo(chat_id, photo_url, caption):
         pass
     return send_telegram_msg(chat_id, caption)
 
-# ==================== BROADCAST (BÜTÜN ABUNƏÇİLƏRƏ) ====================
+# ==================== BROADCAST ====================
 def broadcast_ad(ad):
     subscribers = get_active_subscribers()
     if not subscribers:
@@ -248,7 +258,7 @@ def broadcast_ad(ad):
         except Exception as e:
             logger.error(f"İstifadəçiyə ({uid}) göndərilə bilmədi: {e}")
 
-# ==================== TELEGRAM BOT KOMANDALARI & INLINE BUTTONS ====================
+# ==================== TELEGRAM HANDLER (BAKI SAATI İLƏ) ====================
 def handle_telegram_updates():
     offset = 0
     logger.info("Telegram komanda dinləyicisi işə düşdü...")
@@ -263,7 +273,7 @@ def handle_telegram_updates():
             for update in res.get("result", []):
                 offset = update["update_id"] + 1
 
-                # 1. INLINE DÜYMƏ TIKLANMALARI (CALLBACK QUERY)
+                # 1. INLINE DÜYMƏ TIKLANMASI (ADMIN TƏRƏFİNDƏN)
                 cq = update.get("callback_query")
                 if cq:
                     cq_id = cq.get("id")
@@ -273,7 +283,6 @@ def handle_telegram_updates():
                     msg = cq.get("message", {})
                     msg_id = msg.get("message_id")
 
-                    # Yalnız Admin düymələrə klikləyə bilər
                     if from_id == ADMIN_ID and data:
                         parts = data.split(":")
                         action = parts[0]
@@ -297,15 +306,16 @@ def handle_telegram_updates():
                                 plan_title = "1 İllik VIP Abunə"
 
                             exp = add_or_update_user(target_id, "", "", plan_title, days=days, is_active=1)
-                            answer_callback(cq_id, f"{plan_title} aktiv edildi!")
-                            edit_message_text(ADMIN_ID, msg_id, f"✅ <b>TƏSDİQLƏNDİ!</b>\n🆔 ID: <code>{target_id}</code>\n📦 Tarif: <b>{plan_title}</b>\n📅 Bitmə: {exp.strftime('%d.%m.%Y %H:%M')}")
+                            exp_baku_formatted = exp.strftime("%d.%m.%Y %H:%M")
 
-                            # İstifadəçiyə bildiriş göndər
+                            answer_callback(cq_id, f"{plan_title} aktiv edildi!")
+                            edit_message_text(ADMIN_ID, msg_id, f"✅ <b>TƏSDİQLƏNDİ!</b>\n🆔 ID: <code>{target_id}</code>\n📦 Tarif: <b>{plan_title}</b>\n📅 Bitmə tarixi (Bakı vaxtı): <b>{exp_baku_formatted}</b>")
+
                             user_msg = (
                                 f"🎉 <b>TƏBRİKLƏR! Müraciətiniz təsdiqləndi!</b>\n\n"
                                 f"🎁 Sizin üçün <b>{plan_title}</b> aktivləşdirildi!\n"
-                                f"📅 Bitmə tarixi: <b>{exp.strftime('%d.%m.%Y %H:%M')}</b>\n\n"
-                                f"⚡ <i>Tap.az-a düşən yeni sahibindən iPhone elanları avtomatik bura gələcək!</i>"
+                                f"📅 Bitmə tarixi: <b>{exp_baku_formatted} (Bakı vaxtı ilə)</b>\n\n"
+                                f"⚡ <i>Tap.az-a yeni düşən iPhone elanları dərhal bura göndəriləcək!</i>"
                             )
                             send_telegram_msg(target_id, user_msg)
 
@@ -331,36 +341,37 @@ def handle_telegram_updates():
                 if not user_id or not text:
                     continue
 
-                # --- /START KOMANDASI ---
+                baku_now_dt = get_baku_now()
+
+                # --- /START ---
                 if text == "/start":
                     if user_id == ADMIN_ID:
-                        send_telegram_msg(ADMIN_ID, "👑 Salam Sahibkar! Siz Adminsiniz və sisteminizdə limitsiz aktivsiniz.\n\nƏmrlər üçün /admin yazın.")
+                        send_telegram_msg(ADMIN_ID, "👑 <b>Salam Sahibkar!</b> Siz Adminsiniz və sisteminizdə limitsiz aktivsiniz.\n\nƏmrlər üçün /admin yazın.")
                         continue
 
                     existing = get_user(user_id)
-                    # Əgər istifadəçi artıq aktivdirsə:
                     if existing and existing[5] == 1:
                         exp_str = existing[4]
                         try:
-                            exp_dt = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S")
-                            is_valid = exp_dt > datetime.now()
+                            exp_dt = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=BAKU_TZ)
+                            is_valid = exp_dt > baku_now_dt
                         except Exception:
                             is_valid = False
 
                         if is_valid:
+                            exp_show = exp_dt.strftime("%d.%m.%Y %H:%M")
                             status_text = (
                                 f"✅ <b>Abunəliyiniz Aktivdir!</b>\n\n"
                                 f"📦 Tarif: <b>{existing[3]}</b>\n"
-                                f"📅 Bitmə tarixi: <b>{exp_str}</b>\n\n"
-                                f"📱 <i>Yeni iPhone elanları avtomatik olaraq sizə çatdırılır.</i>"
+                                f"📅 Bitmə vaxtı: <b>{exp_show} (Bakı vaxtı)</b>\n\n"
+                                f"📱 <i>Yeni iPhone elanları avtomatik bura daxil olur.</i>"
                             )
                             send_telegram_msg(user_id, status_text)
                             continue
 
-                    # Əgər yeni istifadəçidirsə və ya aktiv deyilsə: TƏSDİQƏ GÖNDƏR
+                    # Təsdiq gözləməyə al
                     register_pending_user(user_id, username, full_name)
 
-                    # İstifadəçiyə gözləmə mesajı
                     pending_text = (
                         f"👋 <b>Salam, {full_name or 'Dəyərli İstifadəçi'}!</b>\n\n"
                         f"🔥 <b>Tap.az iPhone Sahibindən Radar Botuna xoş gəlmisiniz!</b>\n\n"
@@ -370,7 +381,6 @@ def handle_telegram_updates():
                     )
                     send_telegram_msg(user_id, pending_text)
 
-                    # ADMINƏ 1 KLİKLƏ İCAZƏ DÜYMƏLƏRİ İLƏ BİLDİRİŞ GÖNDƏR
                     admin_keyboard = {
                         "inline_keyboard": [
                             [
@@ -400,11 +410,13 @@ def handle_telegram_updates():
                 elif user_id == ADMIN_ID:
                     if text in ["/admin", "admin"]:
                         subs = get_active_subscribers()
+                        baku_current_str = baku_now_dt.strftime("%d.%m.%Y %H:%M:%S")
                         admin_menu = (
                             f"👑 <b>ADMİN İDARƏETMƏ PANELİ</b>\n\n"
+                            f"🕒 <b>Cari Bakı Vaxtı:</b> {baku_current_str}\n"
                             f"📊 <b>Aktiv Abunəçilər:</b> {len(subs)} nəfər\n"
                             f"⏱ <b>Yoxlama İntervalı:</b> {CHECK_INTERVAL} saniyə\n\n"
-                            f"🛠 <b>Əl ilə idarəetmə əmrləri:</b>\n"
+                            f"🛠 <b>Əmrlər:</b>\n"
                             f"• <code>/qosh ID 3d</code> (3 günlük)\n"
                             f"• <code>/qosh ID 1m</code> (1 aylıq)\n"
                             f"• <code>/qosh ID 3m</code> (3 aylıq)\n"
@@ -436,8 +448,10 @@ def handle_telegram_updates():
                                 plan_title = "1 İllik VIP Abunə"
 
                             exp = add_or_update_user(target_id, "", "", plan_title, days=days, is_active=1)
-                            send_telegram_msg(ADMIN_ID, f"✅ İstifadəçi <code>{target_id}</code> üçün <b>{plan_title}</b> aktiv edildi!\n📅 Bitmə: {exp.strftime('%d.%m.%Y %H:%M')}")
-                            send_telegram_msg(target_id, f"🎉 <b>Təbriklər!</b>\n\nSizin üçün <b>{plan_title}</b> aktivləşdirildi!\n📅 Bitmə: <b>{exp.strftime('%d.%m.%Y %H:%M')}</b>")
+                            exp_baku_formatted = exp.strftime("%d.%m.%Y %H:%M")
+
+                            send_telegram_msg(ADMIN_ID, f"✅ İstifadəçi <code>{target_id}</code> üçün <b>{plan_title}</b> aktiv edildi!\n📅 Bitmə (Bakı vaxtı): <b>{exp_baku_formatted}</b>")
+                            send_telegram_msg(target_id, f"🎉 <b>Təbriklər!</b>\n\nSizin üçün <b>{plan_title}</b> aktivləşdirildi!\n📅 Bitmə: <b>{exp_baku_formatted} (Bakı vaxtı)</b>")
                         else:
                             send_telegram_msg(ADMIN_ID, "Format: <code>/qosh ID 1m</code>")
 
@@ -456,9 +470,16 @@ def handle_telegram_updates():
                         else:
                             resp_text = f"👥 <b>BÜTÜN İSTİFADƏÇİLƏR ({len(all_users)} nəfər):</b>\n\n"
                             for u in all_users[:25]:
-                                u_id, u_name, f_name, p_name, exp, is_act = u
-                                status_emoji = "🟢" if is_act and exp > datetime.now().strftime("%Y-%m-%d %H:%M:%S") else "🔴"
-                                resp_text += f"{status_emoji} <b>{f_name or u_name}</b> (ID: <code>{u_id}</code>)\n   📦 {p_name} | ⏳ {exp}\n\n"
+                                u_id, u_name, f_name, p_name, exp_raw, is_act = u
+                                try:
+                                    exp_dt = datetime.strptime(exp_raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=BAKU_TZ)
+                                    exp_str = exp_dt.strftime("%d.%m.%Y %H:%M")
+                                    is_alive = is_act and exp_dt > baku_now_dt
+                                except Exception:
+                                    exp_str = exp_raw
+                                    is_alive = is_act
+                                status_emoji = "🟢" if is_alive else "🔴"
+                                resp_text += f"{status_emoji} <b>{f_name or u_name}</b> (ID: <code>{u_id}</code>)\n   📦 {p_name} | ⏳ {exp_str}\n\n"
                             send_telegram_msg(ADMIN_ID, resp_text)
 
                     elif text.startswith("/duyuru"):
@@ -568,7 +589,7 @@ def get_ad_details(page, ad_url):
         return None
 
 def check_tapaz_ads(page):
-    logger.info("Tap.az yoxlanılır (60s dövrü)...")
+    logger.info("Tap.az yoxlanılır (Bakı vaxtı ilə)...")
     try:
         page.goto(TAPAZ_APPLE_URL, wait_until="domcontentloaded", timeout=35000)
         page.wait_for_timeout(3000)
@@ -623,7 +644,6 @@ def check_tapaz_ads(page):
                 "img_url": details["img_url"]
             }
 
-            # Bütün aktiv abunəçilərə dərhal göndər
             broadcast_ad(ad_data)
             mark_ad_seen(ad_id, matched_model, title, price)
             time.sleep(1)
@@ -636,7 +656,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Tap.az iPhone SaaS Bot 7/24 Aktivdir!")
+        self.wfile.write(b"Tap.az iPhone SaaS Bot 7/24 Aktivdir (Baku Time)!")
 
     def log_message(self, format, *args):
         return
@@ -648,7 +668,8 @@ def run_web_server():
 
 def main():
     init_db()
-    logger.info("Tap.az iPhone SaaS Bot Başladı (İnterval: 60 saniyə)...")
+    now_baku = get_baku_now().strftime("%d.%m.%Y %H:%M:%S")
+    logger.info(f"Tap.az iPhone SaaS Bot Başladı (Bakı vaxtı: {now_baku}, İnterval: 60s)...")
 
     server_thread = threading.Thread(target=run_web_server, daemon=True)
     server_thread.start()
