@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import html
 import logging
 import sqlite3
 import threading
@@ -31,7 +32,7 @@ def get_baku_now():
 # Telegram & Admin konfiqurasiyası
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8873977210:AAGayQLy11TeRvM-42ZTd_H254FbywjBtB4")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7998954235"))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60")) # 60 saniyə (təhlükəsiz Bakı vaxtı ilə)
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60")) # 60 saniyə
 PORT = int(os.getenv("PORT", "10000"))
 
 TAPAZ_APPLE_URL = "https://tap.az/elanlar/elektronika/telefonlar?p%5B749%5D=3855"
@@ -84,8 +85,32 @@ def init_db():
     conn.commit()
     conn.close()
 
-    # Admin həmişə limitsiz aktivdir
     add_or_update_user(ADMIN_ID, "Admin", "Admin", "Sahibkar (Limitsiz)", days=3650, is_active=1)
+
+def cleanup_old_database_records():
+    """
+    Sistemin illərlə donmadan, yüngül və sürətli işləməsi üçün
+    hər 24 saatdan bir köhnə elanları bazadan təmizləyir.
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        # 3 gündən köhnə görülmüş elanları təmizlə
+        cur.execute("DELETE FROM seen_ads WHERE created_at < datetime('now', '-3 days')")
+        deleted_count = cur.rowcount
+        conn.commit()
+        # Bazanı sıxlaşdırıb yaddaşı azad et (VACUUM)
+        cur.execute("VACUUM")
+        conn.close()
+        logger.info(f"Avtomatik 24-saatlıq təmizləmə: {deleted_count} köhnə qeyd silindi, baza optimallaşdırıldı.")
+    except Exception as e:
+        logger.error(f"Köhnə qeydlərin təmizlənməsində xəta: {e}")
+
+def run_daily_cleaner():
+    """Hər 24 saatdan bir təmizləməni icra edən arxa plan prosesi"""
+    while True:
+        time.sleep(86400) # 24 saat = 86400 saniyə
+        cleanup_old_database_records()
 
 def is_ad_seen(ad_id):
     conn = sqlite3.connect(DB_FILE)
@@ -99,8 +124,6 @@ def mark_ad_seen(ad_id, model="", title="", price=""):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("INSERT OR REPLACE INTO seen_ads (id, model, title, price) VALUES (?, ?, ?, ?)", (str(ad_id), model, title, price))
-    conn.commit()
-    cur.execute("DELETE FROM seen_ads WHERE id NOT IN (SELECT id FROM seen_ads ORDER BY created_at DESC LIMIT 3000)")
     conn.commit()
     conn.close()
 
@@ -238,13 +261,20 @@ def broadcast_ad(ad):
         logger.warning("Aktiv abunəçi tapılmadı!")
         return
 
+    # Xüsusi simvolları (<, >, &) təhlükəsiz et
+    safe_model = html.escape(str(ad.get('model', 'iPhone')))
+    safe_price = html.escape(str(ad.get('price', '')))
+    safe_author = html.escape(str(ad.get('author', 'Sahibi')))
+    safe_desc = html.escape(str(ad.get('description', '')))
+    safe_url = html.escape(str(ad.get('url', 'https://tap.az')))
+
     caption = (
         f"⚡ <b>İLK BİZDƏ! YENİ SAHİBİNDƏN İPHONE!</b>\n\n"
-        f"📱 <b>Model:</b> {ad['model']}\n"
-        f"💰 <b>Qiymət:</b> {ad['price']}\n"
-        f"👤 <b>Satıcı:</b> {ad['author']}\n\n"
-        f"📝 <b>Məlumat:</b>\n<i>{ad['description']}</i>\n\n"
-        f"🔗 <a href=\"{ad['url']}\">Elana Tap.az-da Baxmaq Üçün Toxun</a>"
+        f"📱 <b>Model:</b> {safe_model}\n"
+        f"💰 <b>Qiymət:</b> {safe_price}\n"
+        f"👤 <b>Satıcı:</b> {safe_author}\n\n"
+        f"📝 <b>Məlumat:</b>\n<i>{safe_desc}</i>\n\n"
+        f"🔗 <a href=\"{safe_url}\">Elana Tap.az-da Baxmaq Üçün Toxun</a>"
     )
 
     logger.info(f"Elan {len(subscribers)} aktiv abunəçiyə göndərilir: {ad['title']}")
@@ -258,7 +288,7 @@ def broadcast_ad(ad):
         except Exception as e:
             logger.error(f"İstifadəçiyə ({uid}) göndərilə bilmədi: {e}")
 
-# ==================== TELEGRAM HANDLER (BAKI SAATI İLƏ) ====================
+# ==================== TELEGRAM KOMANDALARI & TƏSDİQ SİSTEMİ ====================
 def handle_telegram_updates():
     offset = 0
     logger.info("Telegram komanda dinləyicisi işə düşdü...")
@@ -273,7 +303,6 @@ def handle_telegram_updates():
             for update in res.get("result", []):
                 offset = update["update_id"] + 1
 
-                # 1. INLINE DÜYMƏ TIKLANMASI (ADMIN TƏRƏFİNDƏN)
                 cq = update.get("callback_query")
                 if cq:
                     cq_id = cq.get("id")
@@ -309,7 +338,7 @@ def handle_telegram_updates():
                             exp_baku_formatted = exp.strftime("%d.%m.%Y %H:%M")
 
                             answer_callback(cq_id, f"{plan_title} aktiv edildi!")
-                            edit_message_text(ADMIN_ID, msg_id, f"✅ <b>TƏSDİQLƏNDİ!</b>\n🆔 ID: <code>{target_id}</code>\n📦 Tarif: <b>{plan_title}</b>\n📅 Bitmə tarixi (Bakı vaxtı): <b>{exp_baku_formatted}</b>")
+                            edit_message_text(ADMIN_ID, msg_id, f"✅ <b>TƏSDİQLƏNDİ!</b>\n🆔 ID: <code>{target_id}</code>\n📦 Tarif: <b>{plan_title}</b>\n📅 Bitmə: <b>{exp_baku_formatted} (Bakı vaxtı)</b>")
 
                             user_msg = (
                                 f"🎉 <b>TƏBRİKLƏR! Müraciətiniz təsdiqləndi!</b>\n\n"
@@ -327,7 +356,6 @@ def handle_telegram_updates():
 
                     continue
 
-                # 2. ADİ MESAJLAR
                 msg = update.get("message")
                 if not msg:
                     continue
@@ -343,7 +371,6 @@ def handle_telegram_updates():
 
                 baku_now_dt = get_baku_now()
 
-                # --- /START ---
                 if text == "/start":
                     if user_id == ADMIN_ID:
                         send_telegram_msg(ADMIN_ID, "👑 <b>Salam Sahibkar!</b> Siz Adminsiniz və sisteminizdə limitsiz aktivsiniz.\n\nƏmrlər üçün /admin yazın.")
@@ -369,7 +396,6 @@ def handle_telegram_updates():
                             send_telegram_msg(user_id, status_text)
                             continue
 
-                    # Təsdiq gözləməyə al
                     register_pending_user(user_id, username, full_name)
 
                     pending_text = (
@@ -406,7 +432,6 @@ def handle_telegram_updates():
                     )
                     send_telegram_msg(ADMIN_ID, admin_notice, reply_markup=admin_keyboard)
 
-                # --- ADMIN KOMANDALARI ---
                 elif user_id == ADMIN_ID:
                     if text in ["/admin", "admin"]:
                         subs = get_active_subscribers()
@@ -415,7 +440,8 @@ def handle_telegram_updates():
                             f"👑 <b>ADMİN İDARƏETMƏ PANELİ</b>\n\n"
                             f"🕒 <b>Cari Bakı Vaxtı:</b> {baku_current_str}\n"
                             f"📊 <b>Aktiv Abunəçilər:</b> {len(subs)} nəfər\n"
-                            f"⏱ <b>Yoxlama İntervalı:</b> {CHECK_INTERVAL} saniyə\n\n"
+                            f"⏱ <b>Yoxlama İntervalı:</b> {CHECK_INTERVAL} saniyə\n"
+                            f"🧹 <b>Avto-Təmizləmə:</b> 24 saatdan bir aktivdir\n\n"
                             f"🛠 <b>Əmrlər:</b>\n"
                             f"• <code>/qosh ID 3d</code> (3 günlük)\n"
                             f"• <code>/qosh ID 1m</code> (1 aylıq)\n"
@@ -542,11 +568,14 @@ def contains_blacklist(text):
             return True
     return False
 
-def get_ad_details(page, ad_url):
+def get_ad_details(context, ad_url):
+    """Detalları ayrıca təmiz tabda yoxlayır və dərhal bağlayır"""
+    det_page = None
     try:
-        page.goto(ad_url, wait_until="domcontentloaded", timeout=25000)
-        page.wait_for_timeout(1500)
-        soup = BeautifulSoup(page.content(), "html.parser")
+        det_page = context.new_page()
+        det_page.goto(ad_url, wait_until="domcontentloaded", timeout=25000)
+        det_page.wait_for_timeout(1500)
+        soup = BeautifulSoup(det_page.content(), "html.parser")
 
         # 1. İş saatları varmı?
         if soup.find(attrs={"data-testid": "author-info-working-schedule"}):
@@ -587,8 +616,14 @@ def get_ad_details(page, ad_url):
     except Exception as e:
         logger.error(f"Elan detalları xətası: {e}")
         return None
+    finally:
+        if det_page:
+            try:
+                det_page.close()
+            except Exception:
+                pass
 
-def check_tapaz_ads(page):
+def check_tapaz_ads(page, context):
     logger.info("Tap.az yoxlanılır (Bakı vaxtı ilə)...")
     try:
         page.goto(TAPAZ_APPLE_URL, wait_until="domcontentloaded", timeout=35000)
@@ -626,9 +661,9 @@ def check_tapaz_ads(page):
             price = price_elem.text.strip() if price_elem else "Göstərilməyib"
 
             full_url = urljoin(BASE_URL, href)
-            logger.info(f"Uyğun model tapıldı: {matched_model} - {title} ({price}) | Sahib yoxlanılır...")
+            logger.info(f"Uyğun model tapıldı: {matched_model} - {title} ({price}) | Yoxlanılır...")
 
-            details = get_ad_details(page, full_url)
+            details = get_ad_details(context, full_url)
             if not details:
                 mark_ad_seen(ad_id, matched_model, title, price)
                 continue
@@ -656,7 +691,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Tap.az iPhone SaaS Bot 7/24 Aktivdir (Baku Time)!")
+        self.wfile.write(b"Tap.az iPhone SaaS Bot 7/24 Aktivdir!")
 
     def log_message(self, format, *args):
         return
@@ -671,12 +706,19 @@ def main():
     now_baku = get_baku_now().strftime("%d.%m.%Y %H:%M:%S")
     logger.info(f"Tap.az iPhone SaaS Bot Başladı (Bakı vaxtı: {now_baku}, İnterval: 60s)...")
 
+    # 1. Render üçün Health Server
     server_thread = threading.Thread(target=run_web_server, daemon=True)
     server_thread.start()
 
+    # 2. Telegram Komanda və Təsdiq Dinləyicisi
     updates_thread = threading.Thread(target=handle_telegram_updates, daemon=True)
     updates_thread.start()
 
+    # 3. Hər 24 saatdan bir köhnə elanları təmizləyən avto-mexanizm
+    cleaner_thread = threading.Thread(target=run_daily_cleaner, daemon=True)
+    cleaner_thread.start()
+
+    # 4. Playwright Skraper
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -694,11 +736,24 @@ def main():
         context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = context.new_page()
 
+        cycle_count = 0
         while True:
             try:
-                check_tapaz_ads(page)
+                check_tapaz_ads(page, context)
             except Exception as e:
                 logger.error(f"Əsas dövr xətası: {e}")
+
+            cycle_count += 1
+            # Hər 500 dövrdən bir (təqribən 8 saatda bir) Chromium brauzer yaddaşını sıfırla ki, RAM heç vaxt dolmasın
+            if cycle_count >= 500:
+                try:
+                    logger.info("Brauzer yaddaşı yenilənir (Memory Optimization)...")
+                    page.close()
+                    page = context.new_page()
+                    cycle_count = 0
+                except Exception:
+                    pass
+
             time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
