@@ -1,0 +1,6 @@
+.env
+seen_ads.db
+__pycache__/
+*.pyc
+.DS_Store
+
