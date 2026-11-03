@@ -164,7 +164,8 @@ def contains_blacklist(text):
 
 def get_ad_details(ad_url):
     try:
-        resp = requests.get(ad_url, headers=HEADERS, impersonate="chrome120", timeout=15)
+        session = requests.Session(impersonate="chrome120")
+        resp = session.get(ad_url, timeout=15)
         if resp.status_code != 200:
             return None
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -263,9 +264,11 @@ def send_telegram_alert(ad):
 def check_tapaz_ads():
     logger.info("Tap.az yoxlanılır...")
     try:
-        resp = requests.get(TAPAZ_APPLE_URL, headers=HEADERS, impersonate="chrome120", timeout=15)
+        session = requests.Session(impersonate="chrome120")
+        resp = session.get(TAPAZ_APPLE_URL, timeout=15)
         if resp.status_code != 200:
             logger.warning(f"Tap.az status kodu: {resp.status_code}")
+            logger.warning(f"Cavab mətni (ilk 300 simvol): {resp.text[:300]}")
             return
 
         soup = BeautifulSoup(resp.text, "html.parser")
