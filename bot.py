@@ -6,8 +6,9 @@ import sqlite3
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urljoin
-from curl_cffi import requests
+import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
 
 # Ətraf mühit dəyişənlərini yüklə
@@ -29,21 +30,6 @@ PORT = int(os.getenv("PORT", "10000")) # Render üçün port
 # Tap.az Apple telefonlar kateqoriyası
 TAPAZ_APPLE_URL = "https://tap.az/elanlar/elektronika/telefonlar?p%5B749%5D=3855"
 BASE_URL = "https://tap.az"
-
-# Sorğular üçün Header-lər
-HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-    "Accept-Language": "az,tr-TR;q=0.9,tr;q=0.8,en-US;q=0.7,en;q=0.6,ru;q=0.5",
-    "Referer": "https://tap.az/",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1"
-}
 
 # Qara siyahı — Mağaza və Alverçi sözləri
 BLACKLIST_KEYWORDS = [
@@ -162,13 +148,11 @@ def contains_blacklist(text):
             return True
     return False
 
-def get_ad_details(ad_url):
+def get_ad_details(page, ad_url):
     try:
-        session = requests.Session(impersonate="chrome120")
-        resp = session.get(ad_url, timeout=15)
-        if resp.status_code != 200:
-            return None
-        soup = BeautifulSoup(resp.text, "html.parser")
+        page.goto(ad_url, wait_until="domcontentloaded", timeout=25000)
+        page.wait_for_timeout(1500)
+        soup = BeautifulSoup(page.content(), "html.parser")
 
         # 1. İş saatları varmı?
         schedule = soup.find(attrs={"data-testid": "author-info-working-schedule"})
@@ -261,17 +245,14 @@ def send_telegram_alert(ad):
         logger.error(f"Telegram göndərmə xətası: {e}")
         return False
 
-def check_tapaz_ads():
-    logger.info("Tap.az yoxlanılır...")
+def check_tapaz_ads(page):
+    logger.info("Tap.az yoxlanılır (Playwright ilə)...")
     try:
-        session = requests.Session(impersonate="chrome120")
-        resp = session.get(TAPAZ_APPLE_URL, timeout=15)
-        if resp.status_code != 200:
-            logger.warning(f"Tap.az status kodu: {resp.status_code}")
-            logger.warning(f"Cavab mətni (ilk 300 simvol): {resp.text[:300]}")
-            return
+        page.goto(TAPAZ_APPLE_URL, wait_until="domcontentloaded", timeout=35000)
+        # Cloudflare yoxlaması olarsa avtomatik həll olunmasını gözləyirik
+        page.wait_for_timeout(4000)
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        soup = BeautifulSoup(page.content(), "html.parser")
         
         latest_section = soup.find(attrs={"data-testid": "latest-ads-section"})
         cards = latest_section.find_all(attrs={"data-testid": "ad-card"}) if latest_section else soup.find_all(attrs={"data-testid": "ad-card"})
@@ -308,7 +289,7 @@ def check_tapaz_ads():
             full_url = urljoin(BASE_URL, href)
             logger.info(f"Uyğun model tapıldı: {matched_model} - {title} ({price}) | Yoxlanılır...")
 
-            details = get_ad_details(full_url)
+            details = get_ad_details(page, full_url)
             if not details:
                 mark_ad_seen(ad_id, matched_model, title, price)
                 continue
@@ -354,12 +335,29 @@ def main():
     server_thread = threading.Thread(target=run_web_server, daemon=True)
     server_thread.start()
 
-    while True:
-        try:
-            check_tapaz_ads()
-        except Exception as e:
-            logger.error(f"Əsas dövr xətası: {e}")
-        time.sleep(CHECK_INTERVAL)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu"
+            ]
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800}
+        )
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        page = context.new_page()
+
+        while True:
+            try:
+                check_tapaz_ads(page)
+            except Exception as e:
+                logger.error(f"Əsas dövr xətası: {e}")
+            time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
     main()

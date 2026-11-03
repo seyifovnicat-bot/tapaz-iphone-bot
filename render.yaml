@@ -2,7 +2,7 @@ services:
   - type: web
     name: tapaz-iphone-bot
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: ./build.sh
     startCommand: python bot.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
@@ -11,4 +11,3 @@ services:
         sync: false
       - key: CHECK_INTERVAL
         value: "30"
-
