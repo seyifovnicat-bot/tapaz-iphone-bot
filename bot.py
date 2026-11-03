@@ -6,7 +6,7 @@ import sqlite3
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urljoin
-import requests
+from curl_cffi import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -32,10 +32,17 @@ BASE_URL = "https://tap.az"
 
 # Sorğular üçün Header-lər
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "az,tr,en-US,en;q=0.9,ru;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "az,tr-TR;q=0.9,tr;q=0.8,en-US;q=0.7,en;q=0.6,ru;q=0.5",
     "Referer": "https://tap.az/",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1"
 }
 
 # Qara siyahı — Mağaza və Alverçi sözləri
@@ -99,21 +106,11 @@ def mark_ad_seen(ad_id, model="", title="", price=""):
     cur = conn.cursor()
     cur.execute("INSERT OR REPLACE INTO seen_ads (id, model, title, price) VALUES (?, ?, ?, ?)", (str(ad_id), model, title, price))
     conn.commit()
-    # Bazanı təmiz saxla (maksimum son 3000 elan)
     cur.execute("DELETE FROM seen_ads WHERE id NOT IN (SELECT id FROM seen_ads ORDER BY created_at DESC LIMIT 3000)")
     conn.commit()
     conn.close()
 
 def match_requested_model(title):
-    """
-    Yalnız tələb olunan modelləri seçir:
-    - iPhone 13, iPhone 13 Pro
-    - iPhone 14, iPhone 14 Pro
-    - iPhone 15, iPhone 15 Pro
-    - iPhone 16 (Sadə)
-    
-    Qadağandır: Pro Max, Plus, Mini, 11, 12, 16 Pro, 16 Pro Max, XS və s.
-    """
     t = title.lower()
 
     if "iphone" not in t:
@@ -166,22 +163,16 @@ def contains_blacklist(text):
     return False
 
 def get_ad_details(ad_url):
-    """
-    Elanın daxili səhifəsini yoxlayır:
-    - Satıcı tipi (Mağazadırsa və ya iş saatları varsa rədd edir)
-    - Təsvir mətni (Açar söz qara siyahısı)
-    - Şəkil URL-i
-    """
     try:
-        resp = requests.get(ad_url, headers=HEADERS, timeout=12)
+        resp = requests.get(ad_url, headers=HEADERS, impersonate="chrome120", timeout=15)
         if resp.status_code != 200:
             return None
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # 1. İş saatları varmı? (Mağazalarda olur)
+        # 1. İş saatları varmı?
         schedule = soup.find(attrs={"data-testid": "author-info-working-schedule"})
         if schedule:
-            logger.info(f"Rədd edildi (İş saatları aşkarlandı - Mağazadır): {ad_url}")
+            logger.info(f"Rədd edildi (İş saatları - Mağazadır): {ad_url}")
             return None
 
         # 2. Satıcı adı
@@ -191,23 +182,22 @@ def get_ad_details(ad_url):
             logger.info(f"Rədd edildi (Satıcı adında mağaza sözü): {author_name}")
             return None
 
-        # 3. Satıcının elan sayı (Məsələn: '45 elan' - çoxdursa alverçidir)
+        # 3. Satıcının elan sayı (> 4 olarsa alverçidir)
         author_link = soup.find(attrs={"data-testid": "author-info-link"})
         if author_link:
             count_match = re.search(r'(\d+)\s*elan', author_link.text.lower())
             if count_match:
                 elan_count = int(count_match.group(1))
-                if elan_count > 4: # 4-dən çox elanı olan şəxs alverçi/mağaza sayılır
-                    logger.info(f"Rədd edildi (Satıcının {elan_count} elanı var - Alverçidir): {ad_url}")
+                if elan_count > 4:
+                    logger.info(f"Rədd edildi (Satıcının {elan_count} elanı var - Alverçi): {ad_url}")
                     return None
 
-        # 4. Təsvir mətni (Description)
+        # 4. Təsvir mətni
         desc_elem = soup.find("div", class_=lambda c: c and "DescriptionContainer" in c)
         description = desc_elem.text.strip() if desc_elem else ""
 
-        # Mətndə qara siyahı sözləri varmı?
         if contains_blacklist(description):
-            logger.info(f"Rədd edildi (Təsvirdə qara siyahı sözü tapıldı): {ad_url}")
+            logger.info(f"Rədd edildi (Qara siyahı sözü tapıldı): {ad_url}")
             return None
 
         # 5. Əsas şəkil
@@ -218,24 +208,16 @@ def get_ad_details(ad_url):
             if img_tag and img_tag.get("src"):
                 img_url = img_tag["src"]
 
-        # 6. Yer / Region
-        props_elem = soup.find("div", class_=lambda c: c and "PropertiesBox" in c)
-        props_text = props_elem.text.strip() if props_elem else ""
-
         return {
             "author": author_name,
             "description": description[:600],
-            "img_url": img_url,
-            "props": props_text
+            "img_url": img_url
         }
     except Exception as e:
-        logger.error(f"Elan detalları alınarkən xəta: {e}")
+        logger.error(f"Elan detalları xətası: {e}")
         return None
 
 def send_telegram_alert(ad):
-    """
-    Telegram-a gözəl formatda elan göndərir.
-    """
     caption = (
         f"📱 <b>YENİ SAHİBİNDƏN İPHONE ELANI!</b>\n\n"
         f"🔹 <b>Model:</b> {ad['model']}\n"
@@ -249,7 +231,6 @@ def send_telegram_alert(ad):
     url_msg = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
     try:
-        # Əgər şəkil varsa sendPhoto ilə göndər
         if ad.get("img_url"):
             data = {
                 "chat_id": TELEGRAM_CHAT_ID,
@@ -262,7 +243,6 @@ def send_telegram_alert(ad):
                 logger.info(f"Telegram-a göndərildi (Foto ilə): {ad['title']}")
                 return True
 
-        # Şəkil alınmadısa və ya xəta verdisə adi mesaj göndər
         data = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": caption,
@@ -281,27 +261,21 @@ def send_telegram_alert(ad):
         return False
 
 def check_tapaz_ads():
-    """
-    Tap.az son iPhone elanlarını skan edir.
-    """
     logger.info("Tap.az yoxlanılır...")
     try:
-        resp = requests.get(TAPAZ_APPLE_URL, headers=HEADERS, timeout=15)
+        resp = requests.get(TAPAZ_APPLE_URL, headers=HEADERS, impersonate="chrome120", timeout=15)
         if resp.status_code != 200:
             logger.warning(f"Tap.az status kodu: {resp.status_code}")
             return
 
         soup = BeautifulSoup(resp.text, "html.parser")
         
-        # Son elanlar bölməsini tapırıq
         latest_section = soup.find(attrs={"data-testid": "latest-ads-section"})
         cards = latest_section.find_all(attrs={"data-testid": "ad-card"}) if latest_section else soup.find_all(attrs={"data-testid": "ad-card"})
 
         logger.info(f"Səhifədə {len(cards)} ədəd kart tapıldı.")
 
-        # Ən köhnədən ən yeniyə ardıcıllıqla göndərmək üçün tərsinə çeviririk
         for card in reversed(cards):
-            # 1. 'Mağaza' teqi kartın özündə varsa dərhal RƏDD ET
             if card.find(string=lambda t: t and "Mağaza" in t):
                 continue
 
@@ -309,21 +283,17 @@ def check_tapaz_ads():
             if not href:
                 continue
 
-            # Elan ID-sini çıxar
             ad_id_match = re.search(r'/(\d+)(?:\?|$)', href)
             if not ad_id_match:
                 continue
             ad_id = ad_id_match.group(1)
 
-            # Əvvəl görülən elandırsa keç
             if is_ad_seen(ad_id):
                 continue
 
-            # Başlıq və Qiymət
             title_elem = card.find(attrs={"data-testid": "ad-card-title"})
             title = title_elem.text.strip() if title_elem else ""
 
-            # Model filtri
             matched_model = match_requested_model(title)
             if not matched_model:
                 mark_ad_seen(ad_id, "UNMATCHED", title)
@@ -335,14 +305,11 @@ def check_tapaz_ads():
             full_url = urljoin(BASE_URL, href)
             logger.info(f"Uyğun model tapıldı: {matched_model} - {title} ({price}) | Yoxlanılır...")
 
-            # Ətraflı məlumatları və daxili filtrləri yoxla
             details = get_ad_details(full_url)
             if not details:
-                # Alverçi və ya mağaza olduğu üçün və ya xəta səbəbilə ləğv edildi
                 mark_ad_seen(ad_id, matched_model, title, price)
                 continue
 
-            # Hər şey təmizdir — Telegram-a göndər!
             ad_data = {
                 "id": ad_id,
                 "model": matched_model,
@@ -357,13 +324,11 @@ def check_tapaz_ads():
             if send_telegram_alert(ad_data):
                 mark_ad_seen(ad_id, matched_model, title, price)
             
-            # Sorğular arası qısa fasilə
             time.sleep(2)
 
     except Exception as e:
         logger.error(f"Skanlama zamanı xəta: {e}")
 
-# Render Web Service üçün sadə HTTP Server (7/24 oyaq qalması üçün)
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -372,7 +337,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Tap.az iPhone Bot 7/24 Aktivdir!")
 
     def log_message(self, format, *args):
-        # Konsolu doldurmamaq üçün adi sorğu loqlarını gizlət
         return
 
 def run_web_server():
@@ -384,11 +348,9 @@ def main():
     init_db()
     logger.info("Tap.az iPhone İzləmə Botu Başladı...")
 
-    # Render üçün arxa planda HTTP server işə salırıq
     server_thread = threading.Thread(target=run_web_server, daemon=True)
     server_thread.start()
 
-    # Əsas skan dövriyyəsi
     while True:
         try:
             check_tapaz_ads()
@@ -398,4 +360,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
