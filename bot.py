@@ -23,7 +23,7 @@ logger = logging.getLogger("TapAzBot")
 # Telegram & Admin konfiqurasiyası
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8873977210:AAGayQLy11TeRvM-42ZTd_H254FbywjBtB4")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7998954235"))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "20")) # Sürətli yoxlama: 20 saniyə
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60")) # 60 saniyə (təhlükəsiz və bloklanmayan interval)
 PORT = int(os.getenv("PORT", "10000"))
 
 TAPAZ_APPLE_URL = "https://tap.az/elanlar/elektronika/telefonlar?p%5B749%5D=3855"
@@ -53,7 +53,6 @@ DB_FILE = "bot_system.db"
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    # Görülmüş elanlar
     cur.execute("""
         CREATE TABLE IF NOT EXISTS seen_ads (
             id TEXT PRIMARY KEY,
@@ -63,7 +62,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Abunəçilər cədvəli
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -71,15 +69,15 @@ def init_db():
             full_name TEXT,
             plan_name TEXT,
             expires_at TIMESTAMP,
-            is_active INTEGER DEFAULT 1,
+            is_active INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
     conn.close()
 
-    # Admini həmişə aktiv saxla
-    add_or_update_user(ADMIN_ID, "Admin", "Admin", "Sahibkar (Limitsiz)", days=3650)
+    # Admin həmişə limitsiz aktivdir
+    add_or_update_user(ADMIN_ID, "Admin", "Admin", "Sahibkar (Limitsiz)", days=3650, is_active=1)
 
 def is_ad_seen(ad_id):
     conn = sqlite3.connect(DB_FILE)
@@ -98,20 +96,34 @@ def mark_ad_seen(ad_id, model="", title="", price=""):
     conn.commit()
     conn.close()
 
-def add_or_update_user(user_id, username, full_name, plan_name, days=3):
+def register_pending_user(user_id, username, full_name):
+    """Yeni istifadəçini təsdiq gözləyən kimi qeyd edir"""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO users (user_id, username, full_name, plan_name, expires_at, is_active)
+        VALUES (?, ?, ?, 'Təsdiq Gözləyir', datetime('now'), 0)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            full_name=excluded.full_name
+    """, (user_id, username or "", full_name or ""))
+    conn.commit()
+    conn.close()
+
+def add_or_update_user(user_id, username, full_name, plan_name, days=3, is_active=1):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     expires_at = datetime.now() + timedelta(days=days)
     cur.execute("""
         INSERT INTO users (user_id, username, full_name, plan_name, expires_at, is_active)
-        VALUES (?, ?, ?, ?, ?, 1)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            full_name=excluded.full_name,
+            username=CASE WHEN excluded.username != '' THEN excluded.username ELSE users.username END,
+            full_name=CASE WHEN excluded.full_name != '' THEN excluded.full_name ELSE users.full_name END,
             plan_name=excluded.plan_name,
             expires_at=excluded.expires_at,
-            is_active=1
-    """, (user_id, username or "", full_name or "", plan_name, expires_at.strftime("%Y-%m-%d %H:%M:%S")))
+            is_active=excluded.is_active
+    """, (user_id, username or "", full_name or "", plan_name, expires_at.strftime("%Y-%m-%d %H:%M:%S"), is_active))
     conn.commit()
     conn.close()
     return expires_at
@@ -170,6 +182,29 @@ def send_telegram_msg(chat_id, text, reply_markup=None):
         logger.error(f"Telegram mesaj xətası: {e}")
         return None
 
+def answer_callback(callback_query_id, text=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+    try:
+        payload = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        requests.post(url, json=payload, timeout=8)
+    except Exception:
+        pass
+
+def edit_message_text(chat_id, message_id, text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+    try:
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        requests.post(url, json=payload, timeout=8)
+    except Exception:
+        pass
+
 def send_telegram_photo(chat_id, photo_url, caption):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     payload = {
@@ -184,7 +219,6 @@ def send_telegram_photo(chat_id, photo_url, caption):
             return True
     except Exception:
         pass
-    # Əgər şəkillə göndərilməsə mətn kimi göndər
     return send_telegram_msg(chat_id, caption)
 
 # ==================== BROADCAST (BÜTÜN ABUNƏÇİLƏRƏ) ====================
@@ -210,15 +244,12 @@ def broadcast_ad(ad):
                 send_telegram_photo(uid, ad["img_url"], caption)
             else:
                 send_telegram_msg(uid, caption)
-            time.sleep(0.05) # Telegram flood limitindən qorunma
+            time.sleep(0.05)
         except Exception as e:
             logger.error(f"İstifadəçiyə ({uid}) göndərilə bilmədi: {e}")
 
-# ==================== TELEGRAM BOT KOMANDALARI ====================
+# ==================== TELEGRAM BOT KOMANDALARI & INLINE BUTTONS ====================
 def handle_telegram_updates():
-    """
-    İstifadəçilərin /start və Adminin /admin, /qosh komandalarını qəbul edir.
-    """
     offset = 0
     logger.info("Telegram komanda dinləyicisi işə düşdü...")
     while True:
@@ -231,6 +262,62 @@ def handle_telegram_updates():
 
             for update in res.get("result", []):
                 offset = update["update_id"] + 1
+
+                # 1. INLINE DÜYMƏ TIKLANMALARI (CALLBACK QUERY)
+                cq = update.get("callback_query")
+                if cq:
+                    cq_id = cq.get("id")
+                    from_user = cq.get("from", {})
+                    from_id = from_user.get("id")
+                    data = cq.get("data", "")
+                    msg = cq.get("message", {})
+                    msg_id = msg.get("message_id")
+
+                    # Yalnız Admin düymələrə klikləyə bilər
+                    if from_id == ADMIN_ID and data:
+                        parts = data.split(":")
+                        action = parts[0]
+                        target_id = int(parts[1]) if len(parts) > 1 else None
+
+                        if action == "grant" and target_id:
+                            plan_code = parts[2]
+                            days = 3
+                            plan_title = "3 Günlük Sınaq"
+                            if plan_code == "3d":
+                                days = 3
+                                plan_title = "3 Günlük Sınaq"
+                            elif plan_code == "1m":
+                                days = 30
+                                plan_title = "1 Aylıq Abunə"
+                            elif plan_code == "3m":
+                                days = 90
+                                plan_title = "3 Aylıq Abunə"
+                            elif plan_code == "1y":
+                                days = 365
+                                plan_title = "1 İllik VIP Abunə"
+
+                            exp = add_or_update_user(target_id, "", "", plan_title, days=days, is_active=1)
+                            answer_callback(cq_id, f"{plan_title} aktiv edildi!")
+                            edit_message_text(ADMIN_ID, msg_id, f"✅ <b>TƏSDİQLƏNDİ!</b>\n🆔 ID: <code>{target_id}</code>\n📦 Tarif: <b>{plan_title}</b>\n📅 Bitmə: {exp.strftime('%d.%m.%Y %H:%M')}")
+
+                            # İstifadəçiyə bildiriş göndər
+                            user_msg = (
+                                f"🎉 <b>TƏBRİKLƏR! Müraciətiniz təsdiqləndi!</b>\n\n"
+                                f"🎁 Sizin üçün <b>{plan_title}</b> aktivləşdirildi!\n"
+                                f"📅 Bitmə tarixi: <b>{exp.strftime('%d.%m.%Y %H:%M')}</b>\n\n"
+                                f"⚡ <i>Tap.az-a düşən yeni sahibindən iPhone elanları avtomatik bura gələcək!</i>"
+                            )
+                            send_telegram_msg(target_id, user_msg)
+
+                        elif action == "reject" and target_id:
+                            remove_user(target_id)
+                            answer_callback(cq_id, "Müraciət rədd edildi.")
+                            edit_message_text(ADMIN_ID, msg_id, f"❌ <b>RƏDD EDİLDİ!</b>\n🆔 ID: <code>{target_id}</code> üçün icazə verilmədi.")
+                            send_telegram_msg(target_id, "❌ Təəssüf ki, müraciətiniz admin tərəfindən təsdiqlənmədi.")
+
+                    continue
+
+                # 2. ADİ MESAJLAR
                 msg = update.get("message")
                 if not msg:
                     continue
@@ -244,35 +331,19 @@ def handle_telegram_updates():
                 if not user_id or not text:
                     continue
 
-                # --- 1. /START KOMANDASI ---
+                # --- /START KOMANDASI ---
                 if text == "/start":
-                    existing = get_user(user_id)
-                    if not existing:
-                        # 3 Günlük Pulsuz Sınaq Aktivləşdir
-                        exp = add_or_update_user(user_id, username, full_name, "3 Günlük Pulsuz Sınaq", days=3)
-                        welcome_text = (
-                            f"👋 <b>Salam, {full_name or 'Dəyərli İstifadəçi'}!</b>\n\n"
-                            f"🔥 <b>Tap.az iPhone Sahibindən Radar Botuna xoş gəlmisiniz!</b>\n\n"
-                            f"🎁 <b>Sizə 3 GÜNLÜK PULSUZ SINAQ aktiv edildi!</b>\n"
-                            f"📅 Bitmə vaxtı: <b>{exp.strftime('%d.%m.%Y %H:%M')}</b>\n\n"
-                            f"⚡ <i>Sayta yeni düşən iPhone 13, 14, 15 və 16 elanları dərhal şəxsi sahibindən olan kimi ilk sizə göndəriləcək!</i>"
-                        )
-                        send_telegram_msg(user_id, welcome_text)
+                    if user_id == ADMIN_ID:
+                        send_telegram_msg(ADMIN_ID, "👑 Salam Sahibkar! Siz Adminsiniz və sisteminizdə limitsiz aktivsiniz.\n\nƏmrlər üçün /admin yazın.")
+                        continue
 
-                        # Adminə məlumat ver
-                        admin_notice = (
-                            f"🔔 <b>YENİ İSTİFADƏÇİ QOŞULDU!</b>\n"
-                            f"👤 Ad: {full_name}\n"
-                            f"🔗 Username: @{username}\n"
-                            f"🆔 ID: <code>{user_id}</code>\n"
-                            f"🎁 3 günlük sınaq başladı."
-                        )
-                        send_telegram_msg(ADMIN_ID, admin_notice)
-                    else:
+                    existing = get_user(user_id)
+                    # Əgər istifadəçi artıq aktivdirsə:
+                    if existing and existing[5] == 1:
                         exp_str = existing[4]
                         try:
                             exp_dt = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S")
-                            is_valid = exp_dt > datetime.now() and existing[5] == 1
+                            is_valid = exp_dt > datetime.now()
                         except Exception:
                             is_valid = False
 
@@ -281,53 +352,76 @@ def handle_telegram_updates():
                                 f"✅ <b>Abunəliyiniz Aktivdir!</b>\n\n"
                                 f"📦 Tarif: <b>{existing[3]}</b>\n"
                                 f"📅 Bitmə tarixi: <b>{exp_str}</b>\n\n"
-                                f"📱 <i>Elanlar avtomatik olaraq bura daxil olur.</i>"
+                                f"📱 <i>Yeni iPhone elanları avtomatik olaraq sizə çatdırılır.</i>"
                             )
-                        else:
-                            status_text = (
-                                f"⚠️ <b>Abunəlik Müddətiniz Başa Çatıb!</b>\n\n"
-                                f"Elanları almağa davam etmək üçün zəhmət olmasa admin ilə əlaqə saxlayın:\n"
-                                f"👤 Admin: @acountnew1\n\n"
-                                f"💳 <b>Tariflər:</b>\n"
-                                f"• 1 Aylıq Abunə\n"
-                                f"• 3 Aylıq Abunə\n"
-                                f"• 1 İllik VIP Abunə"
-                            )
-                        send_telegram_msg(user_id, status_text)
+                            send_telegram_msg(user_id, status_text)
+                            continue
 
-                # --- 2. ADMIN KOMANDALARI (Yalnız ADMIN_ID üçün) ---
+                    # Əgər yeni istifadəçidirsə və ya aktiv deyilsə: TƏSDİQƏ GÖNDƏR
+                    register_pending_user(user_id, username, full_name)
+
+                    # İstifadəçiyə gözləmə mesajı
+                    pending_text = (
+                        f"👋 <b>Salam, {full_name or 'Dəyərli İstifadəçi'}!</b>\n\n"
+                        f"🔥 <b>Tap.az iPhone Sahibindən Radar Botuna xoş gəlmisiniz!</b>\n\n"
+                        f"⏳ <b>Müraciətiniz qeydə alındı!</b>\n"
+                        f"🆔 Sizin Telegram ID: <code>{user_id}</code>\n\n"
+                        f"<i>Admin təsdiq etdikdən sonra bot sizin üçün dərhal aktivləşəcək və elanlar gəlməyə başlayacaq.</i>"
+                    )
+                    send_telegram_msg(user_id, pending_text)
+
+                    # ADMINƏ 1 KLİKLƏ İCAZƏ DÜYMƏLƏRİ İLƏ BİLDİRİŞ GÖNDƏR
+                    admin_keyboard = {
+                        "inline_keyboard": [
+                            [
+                                {"text": "🎁 3 Günlük Sınaq", "callback_data": f"grant:{user_id}:3d"},
+                                {"text": "📦 1 Aylıq", "callback_data": f"grant:{user_id}:1m"}
+                            ],
+                            [
+                                {"text": "📦 3 Aylıq", "callback_data": f"grant:{user_id}:3m"},
+                                {"text": "💎 1 İllik VIP", "callback_data": f"grant:{user_id}:1y"}
+                            ],
+                            [
+                                {"text": "❌ Rədd Et", "callback_data": f"reject:{user_id}"}
+                            ]
+                        ]
+                    }
+
+                    admin_notice = (
+                        f"🔔 <b>YENİ QOŞULMA MÜRACİƏTİ!</b>\n\n"
+                        f"👤 <b>Ad:</b> {full_name}\n"
+                        f"🔗 <b>Username:</b> @{username if username else 'Yoxdur'}\n"
+                        f"🆔 <b>ID:</b> <code>{user_id}</code>\n\n"
+                        f"İcazə vermək üçün aşağıdakı düymələrdən birini seçin:"
+                    )
+                    send_telegram_msg(ADMIN_ID, admin_notice, reply_markup=admin_keyboard)
+
+                # --- ADMIN KOMANDALARI ---
                 elif user_id == ADMIN_ID:
-                    # /admin menyusu
                     if text in ["/admin", "admin"]:
                         subs = get_active_subscribers()
                         admin_menu = (
                             f"👑 <b>ADMİN İDARƏETMƏ PANELİ</b>\n\n"
-                            f"📊 <b>Aktiv Abunəçilər:</b> {len(subs)} nəfər\n\n"
-                            f"🛠 <b>Əmrlər:</b>\n"
-                            f"➕ <b>İstifadəçini abunə etmək:</b>\n"
-                            f"<code>/qosh ID MÜDDƏT</code>\n"
-                            f"<i>Nümunələr:</i>\n"
-                            f"• <code>/qosh 123456789 3d</code> (3 günlük)\n"
-                            f"• <code>/qosh 123456789 1m</code> (1 aylıq)\n"
-                            f"• <code>/qosh 123456789 3m</code> (3 aylıq)\n"
-                            f"• <code>/qosh 123456789 1y</code> (1 illik)\n"
-                            f"• <code>/qosh 123456789 30</code> (30 gün)\n\n"
-                            f"👥 <b>Siyahıya baxmaq:</b> /istifadeciler\n"
-                            f"❌ <b>Abunəni ləğv etmək:</b> <code>/sil ID</code>\n"
-                            f"📢 <b>Hamıya bildiriş:</b> <code>/duyuru Mətn</code>"
+                            f"📊 <b>Aktiv Abunəçilər:</b> {len(subs)} nəfər\n"
+                            f"⏱ <b>Yoxlama İntervalı:</b> {CHECK_INTERVAL} saniyə\n\n"
+                            f"🛠 <b>Əl ilə idarəetmə əmrləri:</b>\n"
+                            f"• <code>/qosh ID 3d</code> (3 günlük)\n"
+                            f"• <code>/qosh ID 1m</code> (1 aylıq)\n"
+                            f"• <code>/qosh ID 3m</code> (3 aylıq)\n"
+                            f"• <code>/qosh ID 1y</code> (1 illik)\n"
+                            f"• <code>/sil ID</code> (Dayandırmaq)\n"
+                            f"• /istifadeciler (Bütün siyahı)\n"
+                            f"• <code>/duyuru Mətn</code> (Kütləvi mesaj)"
                         )
                         send_telegram_msg(ADMIN_ID, admin_menu)
 
-                    # /qosh <user_id> <muddet>
                     elif text.startswith("/qosh"):
                         parts = text.split()
                         if len(parts) >= 3:
                             target_id = int(parts[1])
                             duration_str = parts[2].lower()
-
                             days = 30
                             plan_title = "1 Aylıq Abunə"
-
                             if duration_str in ["3d", "3gun", "3gün"]:
                                 days = 3
                                 plan_title = "3 Günlük Sınaq"
@@ -340,19 +434,13 @@ def handle_telegram_updates():
                             elif duration_str in ["1y", "1il", "365"]:
                                 days = 365
                                 plan_title = "1 İllik VIP Abunə"
-                            elif duration_str.isdigit():
-                                days = int(duration_str)
-                                plan_title = f"{days} Günlük Abunə"
 
-                            exp = add_or_update_user(target_id, "", "", plan_title, days=days)
+                            exp = add_or_update_user(target_id, "", "", plan_title, days=days, is_active=1)
                             send_telegram_msg(ADMIN_ID, f"✅ İstifadəçi <code>{target_id}</code> üçün <b>{plan_title}</b> aktiv edildi!\n📅 Bitmə: {exp.strftime('%d.%m.%Y %H:%M')}")
-                            
-                            # Həmin istifadəçiyə də təbrik mesajı göndər
-                            send_telegram_msg(target_id, f"🎉 <b>Təbriklər!</b>\n\nSizin <b>{plan_title}</b> uğurla aktivləşdirildi!\n📅 Bitmə tarixi: <b>{exp.strftime('%d.%m.%Y %H:%M')}</b>\n\nElanlar gəlməyə davam edəcək!")
+                            send_telegram_msg(target_id, f"🎉 <b>Təbriklər!</b>\n\nSizin üçün <b>{plan_title}</b> aktivləşdirildi!\n📅 Bitmə: <b>{exp.strftime('%d.%m.%Y %H:%M')}</b>")
                         else:
-                            send_telegram_msg(ADMIN_ID, "❌ Format: <code>/qosh ID 1m</code> və ya <code>/qosh ID 3m</code>")
+                            send_telegram_msg(ADMIN_ID, "Format: <code>/qosh ID 1m</code>")
 
-                    # /sil <user_id>
                     elif text.startswith("/sil"):
                         parts = text.split()
                         if len(parts) >= 2:
@@ -361,7 +449,6 @@ def handle_telegram_updates():
                             send_telegram_msg(ADMIN_ID, f"❌ İstifadəçi <code>{target_id}</code> abunəlikdən çıxarıldı.")
                             send_telegram_msg(target_id, "⚠️ Sizin abunəliyiniz dayandırıldı.")
 
-                    # /istifadeciler
                     elif text in ["/istifadeciler", "/users"]:
                         all_users = get_all_users_list()
                         if not all_users:
@@ -374,7 +461,6 @@ def handle_telegram_updates():
                                 resp_text += f"{status_emoji} <b>{f_name or u_name}</b> (ID: <code>{u_id}</code>)\n   📦 {p_name} | ⏳ {exp}\n\n"
                             send_telegram_msg(ADMIN_ID, resp_text)
 
-                    # /duyuru <mesaj>
                     elif text.startswith("/duyuru"):
                         announcement = text.replace("/duyuru", "").strip()
                         if announcement:
@@ -482,7 +568,7 @@ def get_ad_details(page, ad_url):
         return None
 
 def check_tapaz_ads(page):
-    logger.info("Tap.az yoxlanılır...")
+    logger.info("Tap.az yoxlanılır (60s dövrü)...")
     try:
         page.goto(TAPAZ_APPLE_URL, wait_until="domcontentloaded", timeout=35000)
         page.wait_for_timeout(3000)
@@ -562,17 +648,14 @@ def run_web_server():
 
 def main():
     init_db()
-    logger.info("Tap.az iPhone SaaS Bot Başladı...")
+    logger.info("Tap.az iPhone SaaS Bot Başladı (İnterval: 60 saniyə)...")
 
-    # 1. Render üçün Health Server
     server_thread = threading.Thread(target=run_web_server, daemon=True)
     server_thread.start()
 
-    # 2. Telegram Komanda və Abunəlik Dinləyicisi
     updates_thread = threading.Thread(target=handle_telegram_updates, daemon=True)
     updates_thread.start()
 
-    # 3. Playwright Skraper
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
