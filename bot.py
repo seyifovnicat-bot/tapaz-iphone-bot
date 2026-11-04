@@ -11,8 +11,6 @@ from datetime import datetime, timezone, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urljoin
 import requests
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -691,173 +689,76 @@ def contains_blacklist(text):
                 return True
     return False
 
-class BrowserManager:
-    """Öz-özünü bərpa edən, sönməz Playwright brauzer idarəedicisi"""
-    def __init__(self):
-        self.playwright = None
-        self.browser = None
-        self.context = None
-        self.page = None
+TAPAZ_GRAPHQL_URL = "https://tap.az/graphql"
+GRAPHQL_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "Origin": "https://tap.az",
+    "Referer": "https://tap.az/elanlar/elektronika/telefonlar"
+}
 
-    def start(self):
-        self.close()
-        try:
-            self.playwright = sync_playwright().start()
-            # Stabil, OOM-dən qorunan və çökməyən bayraqlar (təhlükəli --single-process çıxarıldı)
-            self.browser = self.playwright.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-setuid-sandbox",
-                    "--no-first-run",
-                    "--no-zygote"
-                ]
-            )
-            self.context = self.browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800}
-            )
-            self.context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            self.page = self.context.new_page()
-
-            def block_media(route):
-                if route.request.resource_type in ["image", "media", "font"]:
-                    route.abort()
-                else:
-                    route.continue_()
-            self.page.route("**/*", block_media)
-            logger.info("Brauzer (Playwright Chromium) uğurla başladıldı və aktivdir.")
-        except Exception as e:
-            logger.error(f"Brauzer başladılarkən xəta: {e}")
-
-    def get_page(self):
-        try:
-            if self.page and not self.page.is_closed() and self.browser and self.browser.is_connected():
-                return self.page
-        except Exception:
-            pass
-        logger.warning("Brauzer qopuq və ya bağlıdır. Dərhal yenidən başladılır...")
-        self.start()
-        return self.page
-
-    def close(self):
-        for item in [self.page, self.context, self.browser, self.playwright]:
-            try:
-                if item:
-                    item.close() if hasattr(item, "close") else item.stop()
-            except Exception:
-                pass
-        self.page = self.context = self.browser = self.playwright = None
-
-def get_ad_details(page, ad_url):
-    html_content = None
-    try:
-        html_content = page.evaluate("""async (url) => {
-            try {
-                const resp = await fetch(url, { headers: { 'Accept': 'text/html' } });
-                if (resp.ok) return await resp.text();
-            } catch(e) {}
-            return null;
-        }""", ad_url)
-    except Exception as e:
-        logger.warning(f"In-page fetch xətası ({ad_url}): {e}")
-
-    # Ehtiyat: Əgər in-page fetch cavab verməzsə, Python requests ilə sına
-    if not html_content:
-        try:
-            r = requests.get(
-                ad_url,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-                timeout=7
-            )
-            if r.status_code == 200:
-                html_content = r.text
-        except Exception:
-            pass
-
-    # Əgər detallar şəbəkə xətasına görə gəlmədisə, amma elan kartında 'Mağaza' YOXDURSA:
-    # Elanı İTİRMİRİK! Sahibkar elanı kimi qəbul edirik!
-    if not html_content:
-        logger.info(f"Detallar şəbəkədən oxunmadı, lakin mağaza olmadığı üçün elan qəbul edilir: {ad_url}")
-        return {
-            "author": "Sahibi (Şəxsi)",
-            "description": "Ətraflı məlumat üçün elan linkinə keçid edin.",
-            "img_url": None
-        }
-
-    soup = BeautifulSoup(html_content, "html.parser")
-
-    # 1. İş saatları varmı? (Mağazadırsa iş saatı olur)
-    if soup.find(attrs={"data-testid": "author-info-working-schedule"}):
-        logger.info(f"Filtr: Mağaza iş qrafiki tapıldı ({ad_url})")
-        return None
-
-    # 2. Satıcı adı
-    author_elem = soup.find(attrs={"data-testid": "author-info-name"})
-    author_name = author_elem.text.strip() if author_elem else "Sahibi"
-    if contains_blacklist(author_name):
-        logger.info(f"Filtr: Satıcı adı qara siyahıdadır ({author_name}) ({ad_url})")
-        return None
-
-    # 3. Satıcının elan sayı (> 4 olarsa alverçi/mağaza sayılır)
-    author_link = soup.find(attrs={"data-testid": "author-info-link"})
-    if author_link:
-        count_match = re.search(r'(\d+)\s*elan', author_link.text.lower())
-        if count_match and int(count_match.group(1)) > 4:
-            logger.info(f"Filtr: Satıcının {count_match.group(1)} elanı var, alverçi/mağaza sayılır ({ad_url})")
-            return None
-
-    # 4. Təsvir mətni
-    desc_elem = soup.find("div", class_=lambda c: c and "DescriptionContainer" in c)
-    description = desc_elem.text.strip() if desc_elem else ""
-    if contains_blacklist(description):
-        logger.info(f"Filtr: Təsvirdə qara siyahı sözü tapıldı ({ad_url})")
-        return None
-
-    # 5. Şəkil
-    img_elem = soup.find("img", class_=lambda c: c and "SliderImage" in c) or soup.find("div", class_=lambda c: c and "SliderWrapper" in c)
-    img_url = None
-    if img_elem:
-        img_tag = img_elem if img_elem.name == "img" else img_elem.find("img")
-        if img_tag and img_tag.get("src"):
-            img_url = img_tag["src"]
-
-    return {
-        "author": author_name,
-        "description": description[:600],
-        "img_url": img_url
+GRAPHQL_QUERY = """
+query SearchIphones($keywords: String, $first: Int!) {
+  ads(
+    source: APP
+    keywords: $keywords
+    first: $first
+  ) {
+    nodes {
+      id
+      title
+      price
+      hits
+      path
+      region
+      contact {
+        name
+      }
+      photo {
+        url
+      }
+      user {
+        name
+        isShop
+      }
     }
+  }
+}
+"""
 
-def check_tapaz_ads(browser_mgr):
+def check_tapaz_ads():
     BOT_STATS["last_check_at"] = get_baku_now().strftime("%d.%m.%Y %H:%M:%S")
     BOT_STATS["total_checks"] += 1
-    logger.info(f"Tap.az canlı elanlar yoxlanılır (Dövr #{BOT_STATS['total_checks']})...")
+    logger.info(f"Tap.az GraphQL API canlı yoxlanılır (Dövr #{BOT_STATS['total_checks']})...")
 
-    page = browser_mgr.get_page()
+    payload = {
+        "query": GRAPHQL_QUERY,
+        "variables": {
+            "keywords": "iPhone",
+            "first": 40
+        }
+    }
 
     try:
-        page.goto(TAPAZ_APPLE_URL, wait_until="domcontentloaded", timeout=30000)
-        try:
-            page.wait_for_selector('[data-testid="ad-card"]', timeout=8000)
-        except Exception:
-            pass
+        resp = requests.post(TAPAZ_GRAPHQL_URL, json=payload, headers=GRAPHQL_HEADERS, timeout=12)
+        if resp.status_code != 200:
+            logger.error(f"GraphQL API status xətası: {resp.status_code}")
+            return
 
-        soup = BeautifulSoup(page.content(), "html.parser")
-        cards = soup.find_all(attrs={"data-testid": "ad-card"})
-        logger.info(f"Saytda {len(cards)} ədəd elan kartı aşkarlandı.")
+        data = resp.json()
+        ads = data.get("data", {}).get("ads", {}).get("nodes", [])
+        logger.info(f"GraphQL API-dən {len(ads)} ədəd canlı elan alındı.")
 
-        for card in reversed(cards):
-            if card.find(string=lambda t: t and "Mağaza" in t):
+        for ad in reversed(ads):
+            # 1. Mağaza filtri: isShop True olanlar dərhal atılır (YALNIZ ŞƏXSİ SAHİB)
+            user_info = ad.get("user") or {}
+            is_shop = user_info.get("isShop", False)
+            if is_shop:
                 continue
 
-            href = card.get("href")
-            if not href:
-                continue
-
-            ad_id_match = re.search(r'/(\d+)(?:\?|$)', href)
+            raw_path = ad.get("path") or ""
+            ad_id_match = re.search(r'/(\d+)(?:\?|$)', raw_path)
             if not ad_id_match:
                 continue
             ad_id = ad_id_match.group(1)
@@ -865,53 +766,51 @@ def check_tapaz_ads(browser_mgr):
             if is_ad_seen(ad_id):
                 continue
 
-            title_elem = card.find(attrs={"data-testid": "ad-card-title"})
-            title = title_elem.text.strip() if title_elem else ""
-
+            title = (ad.get("title") or "").strip()
             matched_model = match_requested_model(title)
             if not matched_model:
                 mark_ad_seen(ad_id, "UNMATCHED", title)
                 continue
 
-            price_elem = card.find(attrs={"data-testid": "ad-card-price"})
-            price = price_elem.text.strip() if price_elem else "Göstərilməyib"
+            contact_info = ad.get("contact") or {}
+            seller_name = (contact_info.get("name") or user_info.get("name") or "Sahibi").strip()
 
-            # Şəkil kartdan götürülür
-            card_img = None
-            img_tag = card.find("img")
-            if img_tag and img_tag.get("src"):
-                card_img = img_tag["src"]
-
-            full_url = urljoin(BASE_URL, href)
-            logger.info(f"YENİ İPHONE: {matched_model} - {title} ({price}) | Şəxsi sahib yoxlanılır...")
-
-            details = get_ad_details(page, full_url)
-            if not details:
-                mark_ad_seen(ad_id, matched_model, title, price)
+            # Qara siyahı açar sözləri satıcı və ya başlıqda varmı?
+            if contains_blacklist(seller_name) or contains_blacklist(title):
+                mark_ad_seen(ad_id, matched_model, title)
                 continue
+
+            price_val = ad.get("price")
+            if price_val is not None:
+                price_str = f"{int(price_val) if price_val == int(price_val) else price_val} ₼"
+            else:
+                price_str = "Razılaşma ilə"
+
+            photo_obj = ad.get("photo") or {}
+            img_url = photo_obj.get("url")
+            full_url = urljoin(BASE_URL, raw_path)
+            views = ad.get("hits") or 0
+            region = ad.get("region") or "Bakı"
+
+            logger.info(f"YENİ SAHİBİNDƏN İPHONE: {matched_model} - {title} ({price_str}) | Satıcı: {seller_name}")
 
             ad_data = {
                 "id": ad_id,
                 "model": matched_model,
                 "title": title,
-                "price": price,
+                "price": price_str,
                 "url": full_url,
-                "author": details.get("author") or "Sahibi",
-                "description": details.get("description") or "",
-                "img_url": details.get("img_url") or card_img
+                "author": f"{seller_name} (Şəxsi Sahib)",
+                "description": f"📍 Şəhər: {region}\n👁 Baxış sayı: {views}",
+                "img_url": img_url
             }
 
             broadcast_ad(ad_data)
-            mark_ad_seen(ad_id, matched_model, title, price)
-            time.sleep(1)
+            mark_ad_seen(ad_id, matched_model, title, price_str)
+            time.sleep(0.3)
 
     except Exception as e:
-        err_msg = str(e)
-        logger.error(f"Skanlama zamanı xəta: {err_msg}")
-        # Əgər brauzer hər hansı səbəbdən qopubsa və ya bağlanıbsa, dərhal yenidən başladırıq!
-        if any(k in err_msg.lower() for k in ["closed", "target", "crash", "disconnected"]):
-            logger.warning("Brauzer xətası aşkarlandı, brauzer dərhal təzələnir...")
-            browser_mgr.start()
+        logger.error(f"GraphQL sorğusu zamanı xəta: {e}")
 
 # ==================== RENDER KEEP-ALIVE PINGER ====================
 def keep_render_alive():
@@ -1007,7 +906,7 @@ def run_web_server():
 def main():
     init_db()
     now_baku = get_baku_now().strftime("%d.%m.%Y %H:%M:%S")
-    logger.info(f"Tap.az iPhone SaaS Bot Başladı (Bakı: {now_baku}, İnterval: {CHECK_INTERVAL}s)...")
+    logger.info(f"Tap.az iPhone SaaS Bot Başladı (GraphQL API, Bakı: {now_baku}, İnterval: {CHECK_INTERVAL}s)...")
 
     server_thread = threading.Thread(target=run_web_server, daemon=True)
     server_thread.start()
@@ -1021,26 +920,11 @@ def main():
     pinger_thread = threading.Thread(target=keep_render_alive, daemon=True)
     pinger_thread.start()
 
-    browser_mgr = BrowserManager()
-    browser_mgr.start()
-
-    cycle_count = 0
     while True:
         try:
-            check_tapaz_ads(browser_mgr)
+            check_tapaz_ads()
         except Exception as e:
             logger.error(f"Əsas dövr xətası: {e}")
-            browser_mgr.start()
-
-        cycle_count += 1
-        # Hər 30 skandan bir (~22 dəqiqə) yaddaşı tərtəmiz saxlamaq üçün brauzeri yenidən başladırıq
-        if cycle_count >= 30:
-            try:
-                logger.info("Planlaşdırılmış yaddaş yenilənməsi (30 skan tamamlandı)...")
-                browser_mgr.start()
-                cycle_count = 0
-            except Exception:
-                pass
 
         time.sleep(CHECK_INTERVAL)
 
