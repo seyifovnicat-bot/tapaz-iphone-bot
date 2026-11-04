@@ -1,12 +1,13 @@
 import os
 import re
+import json
 import time
 import html
 import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone, timedelta
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
@@ -21,25 +22,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("TapAzBot")
 
-# Bakı Saat Qurşağı (UTC+4)
 BAKU_TZ = timezone(timedelta(hours=4))
 
 def get_baku_now():
-    """Dəqiq Bakı vaxtını qaytarır (UTC+4)"""
+    """Dəqiq Bakı vaxtı (UTC+4)"""
     return datetime.now(BAKU_TZ)
 
-# Telegram & Admin konfiqurasiyası
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8873977210:AAGayQLy11TeRvM-42ZTd_H254FbywjBtB4")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7998954235"))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "45")) # 45 saniyə (sürətli və etibarlı)
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "acountnew1")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "45"))
 PORT = int(os.getenv("PORT", "10000"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://tapaz-iphone-bot-1.onrender.com")
 
-# Real-vaxtda yeni düşən iPhone elanları linki (Ən son elanlar xronoloji ardıcıllıqla)
+# Real-vaxtda yeni düşən iPhone elanları linki
 TAPAZ_APPLE_URL = "https://tap.az/elanlar/elektronika/telefonlar?keywords=iphone"
 BASE_URL = "https://tap.az"
 
-# Global status statistikası
 BOT_STATS = {
     "started_at": get_baku_now().strftime("%d.%m.%Y %H:%M:%S"),
     "last_check_at": "Hələ yoxlanmayıb",
@@ -67,8 +66,46 @@ BLACKLIST_KEYWORDS = [
 ]
 
 DB_FILE = "bot_system.db"
+BACKUP_FILE = "users_backup.json"
 
-# ==================== DATABASE ====================
+# ==================== DATABASE & BACKUP ====================
+def backup_users_to_json():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, username, full_name, plan_name, expires_at, is_active FROM users")
+        rows = cur.fetchall()
+        conn.close()
+        data = []
+        for r in rows:
+            data.append({
+                "user_id": r[0], "username": r[1], "full_name": r[2],
+                "plan_name": r[3], "expires_at": r[4], "is_active": r[5]
+            })
+        with open(BACKUP_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"Backup xətası: {e}")
+
+def restore_users_from_backup():
+    if not os.path.exists(BACKUP_FILE):
+        return
+    try:
+        with open(BACKUP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        for u in data:
+            cur.execute("""
+                INSERT OR IGNORE INTO users (user_id, username, full_name, plan_name, expires_at, is_active)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (u["user_id"], u.get("username",""), u.get("full_name",""), u["plan_name"], u["expires_at"], u["is_active"]))
+        conn.commit()
+        conn.close()
+        logger.info(f"Bərpa: {len(data)} istifadəçi fayldan bərpa edildi.")
+    except Exception as e:
+        logger.warning(f"Bərpa xətası: {e}")
+
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -95,6 +132,7 @@ def init_db():
     conn.commit()
     conn.close()
 
+    restore_users_from_backup()
     add_or_update_user(ADMIN_ID, "Admin", "Admin", "Sahibkar (Limitsiz)", days=3650, is_active=1)
 
 def cleanup_old_database_records():
@@ -143,6 +181,7 @@ def register_pending_user(user_id, username, full_name):
     """, (user_id, username or "", full_name or "", now_baku))
     conn.commit()
     conn.close()
+    backup_users_to_json()
 
 def add_or_update_user(user_id, username, full_name, plan_name, days=3, is_active=1):
     conn = sqlite3.connect(DB_FILE)
@@ -161,6 +200,7 @@ def add_or_update_user(user_id, username, full_name, plan_name, days=3, is_activ
     """, (user_id, username or "", full_name or "", plan_name, exp_str, is_active))
     conn.commit()
     conn.close()
+    backup_users_to_json()
     return expires_at
 
 def get_user(user_id):
@@ -200,6 +240,7 @@ def remove_user(user_id):
     cur.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
+    backup_users_to_json()
 
 # ==================== TELEGRAM API ====================
 def send_telegram_msg(chat_id, text, reply_markup=None):
@@ -292,7 +333,7 @@ def broadcast_ad(ad):
         except Exception as e:
             logger.error(f"İstifadəçiyə ({uid}) göndərilə bilmədi: {e}")
 
-# ==================== TELEGRAM KOMANDALARI & TƏSDİQ ====================
+# ==================== TELEGRAM KOMANDALARI & MÜTŞƏKKİL /START ====================
 def handle_telegram_updates():
     offset = 0
     logger.info("Telegram komanda dinləyicisi işə düşdü...")
@@ -307,6 +348,7 @@ def handle_telegram_updates():
             for update in res.get("result", []):
                 offset = update["update_id"] + 1
 
+                # 1. INLINE DÜYMƏ TIKLANMASI (ADMIN TƏRƏFİNDƏN)
                 cq = update.get("callback_query")
                 if cq:
                     cq_id = cq.get("id")
@@ -375,31 +417,70 @@ def handle_telegram_updates():
 
                 baku_now_dt = get_baku_now()
 
+                # --- /START DƏQİQ MƏNTİQİ ---
                 if text == "/start":
+                    # 1. Admin özü yazanda
                     if user_id == ADMIN_ID:
                         send_telegram_msg(ADMIN_ID, "👑 <b>Salam Sahibkar!</b> Siz Adminsiniz və sisteminizdə limitsiz aktivsiniz.\n\nƏmrlər üçün /admin yazın.")
                         continue
 
                     existing = get_user(user_id)
-                    if existing and existing[5] == 1:
+
+                    # 2. Əgər istifadəçi artıq sistemdə varsa:
+                    if existing:
+                        p_name = existing[3]
                         exp_str = existing[4]
+                        is_act = existing[5]
+
                         try:
                             exp_dt = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=BAKU_TZ)
-                            is_valid = exp_dt > baku_now_dt
+                            is_alive = is_act == 1 and exp_dt > baku_now_dt
                         except Exception:
-                            is_valid = False
+                            is_alive = False
 
-                        if is_valid:
+                        # A) Əgər istifadəçi artıq AKTİV qoşulubsa:
+                        if is_alive:
                             exp_show = exp_dt.strftime("%d.%m.%Y %H:%M")
-                            status_text = (
-                                f"✅ <b>Abunəliyiniz Aktivdir!</b>\n\n"
-                                f"📦 Tarif: <b>{existing[3]}</b>\n"
-                                f"📅 Bitmə vaxtı: <b>{exp_show} (Bakı vaxtı)</b>\n\n"
-                                f"📱 <i>Yeni iPhone elanları avtomatik bura daxil olur.</i>"
+                            already_active_msg = (
+                                f"✅ <b>Siz artıq sistemə qoşulmusunuz!</b>\n\n"
+                                f"📦 Abunəlik növü: <b>{p_name}</b>\n"
+                                f"📅 Bitmə vaxtı: <b>{exp_show} (Bakı vaxtı ilə)</b>\n\n"
+                                f"⚡ <i>Yeni sahibindən iPhone elanları sayta düşən saniyədə avtomatik sizə çatdırılır.</i>\n\n"
+                                f"ℹ️ Əlavə sual, təklif və ya məlumat üçün Admin ilə əlaqə saxlaya bilərsiniz:\n"
+                                f"👤 Admin: @{ADMIN_USERNAME}"
                             )
-                            send_telegram_msg(user_id, status_text)
+                            send_telegram_msg(user_id, already_active_msg)
+                            # QƏTİYYƏN ADMİNƏ BİLDİRİŞ GÖNDƏRMİRİK!
                             continue
 
+                        # B) Əgər hələ təsdiq gözləyirsə (Admin hələ düyməyə basmayıb):
+                        elif p_name == "Təsdiq Gözləyir" or is_act == 0:
+                            pending_wait_msg = (
+                                f"⏳ <b>Müraciətiniz artıq qeydə alınıb!</b>\n\n"
+                                f"🆔 Sizin Telegram ID: <code>{user_id}</code>\n"
+                                f"Sorğunuz adminin təsdiqini gözləyir. Təsdiq olunduqda bot sizə avtomatik bildiriş göndərəcək.\n\n"
+                                f"Tələsirsinizsə, admin ilə əlaqə saxlaya bilərsiniz:\n"
+                                f"👤 Admin: @{ADMIN_USERNAME}"
+                            )
+                            send_telegram_msg(user_id, pending_wait_msg)
+                            # Artıq müraciət edibsə, admini təkrar narahat etmirik!
+                            continue
+
+                        # C) Əgər abunəlik müddəti bitibsə:
+                        else:
+                            expired_msg = (
+                                f"⚠️ <b>Sizin abunəlik müddətiniz başa çatıb!</b>\n\n"
+                                f"Yenidən elanları almaq və ya abunəliyi uzatmaq üçün zəhmət olmasa admin ilə əlaqə saxlayın:\n"
+                                f"👤 Admin: @{ADMIN_USERNAME}\n\n"
+                                f"💳 <b>Tariflər:</b>\n"
+                                f"• 1 Aylıq Abunə\n"
+                                f"• 3 Aylıq Abunə\n"
+                                f"• 1 İllik VIP Abunə"
+                            )
+                            send_telegram_msg(user_id, expired_msg)
+                            continue
+
+                    # 3. YALNIZ İLK DƏFƏ /START EDƏN TAM YENİ İSTİFADƏÇİ:
                     register_pending_user(user_id, username, full_name)
 
                     pending_text = (
@@ -407,7 +488,8 @@ def handle_telegram_updates():
                         f"🔥 <b>Tap.az iPhone Sahibindən Radar Botuna xoş gəlmisiniz!</b>\n\n"
                         f"⏳ <b>Müraciətiniz qeydə alındı!</b>\n"
                         f"🆔 Sizin Telegram ID: <code>{user_id}</code>\n\n"
-                        f"<i>Admin təsdiq etdikdən sonra bot sizin üçün dərhal aktivləşəcək və elanlar gəlməyə başlayacaq.</i>"
+                        f"<i>Admin təsdiq etdikdən sonra bot sizin üçün dərhal aktivləşəcək və elanlar gəlməyə başlayacaq.</i>\n\n"
+                        f"Əlaqə üçün Admin: @{ADMIN_USERNAME}"
                     )
                     send_telegram_msg(user_id, pending_text)
 
@@ -436,6 +518,7 @@ def handle_telegram_updates():
                     )
                     send_telegram_msg(ADMIN_ID, admin_notice, reply_markup=admin_keyboard)
 
+                # --- ADMIN KOMANDALARI ---
                 elif user_id == ADMIN_ID:
                     if text in ["/admin", "admin"]:
                         subs = get_active_subscribers()
@@ -577,11 +660,19 @@ def get_ad_details(context, ad_url):
     det_page = None
     try:
         det_page = context.new_page()
-        det_page.goto(ad_url, wait_until="domcontentloaded", timeout=25000)
-        det_page.wait_for_timeout(1500)
+        # Resurs bloklama: RAM-ı 50MB-da saxlayır
+        def block_media(route):
+            if route.request.resource_type in ["image", "media", "font"]:
+                route.abort()
+            else:
+                route.continue_()
+        det_page.route("**/*", block_media)
+
+        det_page.goto(ad_url, wait_until="domcontentloaded", timeout=20000)
+        det_page.wait_for_timeout(1000)
         soup = BeautifulSoup(det_page.content(), "html.parser")
 
-        # 1. İş saatları varmı? (Mağazadır)
+        # 1. İş saatları varmı?
         if soup.find(attrs={"data-testid": "author-info-working-schedule"}):
             return None
 
@@ -633,14 +724,16 @@ def check_tapaz_ads(page, context):
     logger.info(f"Tap.az canlı elanlar yoxlanılır (Dövr #{BOT_STATS['total_checks']})...")
 
     try:
-        page.goto(TAPAZ_APPLE_URL, wait_until="domcontentloaded", timeout=35000)
-        page.wait_for_timeout(2500)
+        page.goto(TAPAZ_APPLE_URL, wait_until="domcontentloaded", timeout=30000)
+        try:
+            page.wait_for_selector('[data-testid="ad-card"]', timeout=8000)
+        except Exception:
+            pass
 
         soup = BeautifulSoup(page.content(), "html.parser")
         cards = soup.find_all(attrs={"data-testid": "ad-card"})
         logger.info(f"Saytda {len(cards)} ədəd elan kartı aşkarlandı.")
 
-        # Xronoloji ardıcıllıq üçün tərsinə (ən köhnədən ən yeniyə)
         for card in reversed(cards):
             if card.find(string=lambda t: t and "Mağaza" in t):
                 continue
@@ -696,19 +789,13 @@ def check_tapaz_ads(page, context):
 
 # ==================== RENDER KEEP-ALIVE PINGER ====================
 def keep_render_alive():
-    """
-    Render Free xidmətləri 15 dəqiqə sorğu gəlmədikdə yuxuya gedir.
-    Bu funksiya hər 6 dəqiqədən bir öz veb ünvanına HTTP sorğu ataraq
-    serveri 7/24 100% OYAQ saxlayır.
-    """
-    time.sleep(60) # Başlanğıc üçün 1 dəqiqə gözlə
+    time.sleep(60)
     while True:
         try:
-            res = requests.get(RENDER_EXTERNAL_URL, timeout=20)
-            logger.info(f"Render Oyaq-Saxlama P Current Status: {res.status_code}")
-        except Exception as e:
-            logger.warning(f"Keep-alive xətası: {e}")
-        time.sleep(360) # Hər 6 dəqiqədən bir (15 dəqiqə dolmadan)
+            requests.get(RENDER_EXTERNAL_URL, timeout=15)
+        except Exception:
+            pass
+        time.sleep(360)
 
 # ==================== WEB & DIAGNOSTICS SERVER ====================
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -728,8 +815,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             <meta charset="utf-8">
             <meta http-equiv="refresh" content="30">
             <style>
-                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #0d1117; color: #c9d1d9; padding: 30px; }}
-                .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 24px; max-width: 600px; margin: 0 auto; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }}
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; padding: 30px; }}
+                .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 24px; max-width: 600px; margin: 0 auto; }}
                 h1 {{ color: #58a6ff; font-size: 22px; margin-top: 0; }}
                 .badge {{ background: #238636; color: white; padding: 4px 10px; border-radius: 20px; font-weight: bold; font-size: 13px; }}
                 .row {{ display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #21262d; }}
@@ -757,8 +844,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         return
 
 def run_web_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-    logger.info(f"Diaqnostika veb serveri {PORT} portunda işə salındı.")
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+    logger.info(f"Threading veb server {PORT} portunda işə salındı.")
     server.serve_forever()
 
 def main():
@@ -766,23 +853,18 @@ def main():
     now_baku = get_baku_now().strftime("%d.%m.%Y %H:%M:%S")
     logger.info(f"Tap.az iPhone SaaS Bot Başladı (Bakı: {now_baku}, İnterval: {CHECK_INTERVAL}s)...")
 
-    # 1. Render üçün Health Server
     server_thread = threading.Thread(target=run_web_server, daemon=True)
     server_thread.start()
 
-    # 2. Telegram Komanda və Təsdiq Dinləyicisi
     updates_thread = threading.Thread(target=handle_telegram_updates, daemon=True)
     updates_thread.start()
 
-    # 3. Hər 24 saatdan bir köhnə elanları təmizləyən arxa plan
     cleaner_thread = threading.Thread(target=run_daily_cleaner, daemon=True)
     cleaner_thread.start()
 
-    # 4. Render-in yuxuya getməməsi üçün Keep-Alive Pinger
     pinger_thread = threading.Thread(target=keep_render_alive, daemon=True)
     pinger_thread.start()
 
-    # 5. Playwright Skraper
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -800,6 +882,14 @@ def main():
         context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = context.new_page()
 
+        # Resurs bloklama: RAM-ı 60MB-da saxlayır, heç vaxt donmur
+        def block_media(route):
+            if route.request.resource_type in ["image", "media", "font"]:
+                route.abort()
+            else:
+                route.continue_()
+        page.route("**/*", block_media)
+
         cycle_count = 0
         while True:
             try:
@@ -813,6 +903,7 @@ def main():
                     logger.info("Brauzer yaddaşı yenilənir (Memory Optimization)...")
                     page.close()
                     page = context.new_page()
+                    page.route("**/*", block_media)
                     cycle_count = 0
                 except Exception:
                     pass
