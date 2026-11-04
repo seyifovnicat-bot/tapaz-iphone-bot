@@ -43,7 +43,7 @@ def get_baku_now():
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8873977210:AAGayQLy11TeRvM-42ZTd_H254FbywjBtB4")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7998954235"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "acountnew1")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "45"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
 PORT = int(os.getenv("PORT", "10000"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://tapaz-iphone-bot-1.onrender.com")
 
@@ -74,7 +74,10 @@ BLACKLIST_KEYWORDS = [
     "suse hediyye", "kabro hədiyyə", "üzlük hədiyyə", "hediyye", "hədiyyə",
     "topdan", "topdansatış", "topdansatis", "bütün rənglər var", "butun rengler var",
     "say var", "say çoxdur", "say coxdur", "bağlı qutu", "bagli qutu",
-    "açılmamış qutu", "acilmamis qutu", "qutuda yeni"
+    "açılmamış qutu", "acilmamis qutu", "qutuda yeni",
+    "gsm", "telecom", "mobile", "aksesuar", "accessories", "official",
+    "service", "servis", "satış", "satis", "butik", "baku electronics",
+    "kontakt", "irshad", "irşad", "apple store", "apple house", "smart store"
 ]
 
 DB_FILE = "bot_system.db"
@@ -151,18 +154,22 @@ def cleanup_old_database_records():
     try:
         conn = sqlite3.connect(DB_FILE)
         cur = conn.cursor()
-        cur.execute("DELETE FROM seen_ads WHERE created_at < datetime('now', '-3 days')")
+        # 48 saatdan (2 gündən) köhnə qeydlər silinir ki, baza illərlə yüngül qalsın və sistem heç vaxt donmasın
+        cur.execute("DELETE FROM seen_ads WHERE created_at < datetime('now', '-2 days')")
         deleted_count = cur.rowcount
         conn.commit()
         cur.execute("VACUUM")
         conn.close()
-        logger.info(f"Avtomatik 24-saatlıq təmizləmə: {deleted_count} köhnə qeyd silindi.")
+        logger.info(f"Avtomatik 24-saatlıq təmizləmə: {deleted_count} köhnə elan qeydi silindi və VACUUM edildi.")
     except Exception as e:
         logger.error(f"Təmizləmə xətası: {e}")
 
 def run_daily_cleaner():
+    # Bot başlayan kimi dərhal 1 dəfə təmizləyir
+    time.sleep(10)
+    cleanup_old_database_records()
     while True:
-        time.sleep(86400)
+        time.sleep(86400) # Hər 24 saatdan bir dövri təmizləyir
         cleanup_old_database_records()
 
 def is_ad_seen(ad_id):
@@ -644,7 +651,14 @@ def match_requested_model(title):
     if "iphone" not in t:
         return None
 
-    if "pro max" in t or "promax" in t or "plus" in t or "mini" in t:
+    # Pro Max, Plus, Mini və ehtiyat hissələri / aksesuarlar qəti qadağandır
+    excluded_parts = [
+        "pro max", "promax", "plus", "mini", 
+        "ekran", "korpus", "plata", "kamera", "şüşə", "suse", 
+        "batareya", "battery", "adapter", "kabel", "nausnik", 
+        "qutu", "karobka", "case", "kabro"
+    ]
+    if any(k in t for k in excluded_parts):
         return None
 
     # iPhone 16 — YALNIZ sadə model (Pro/Pro Max qadağandır)
@@ -786,10 +800,15 @@ def check_tapaz_ads():
             else:
                 price_str = "Razılaşma ilə"
 
+            views = ad.get("hits") or 0
+            # YALNIZ YENİ DÜŞMÜŞ ELANLAR (İstifadəçi tələbi: maksimum 15-20 baxış)
+            if views > 20:
+                mark_ad_seen(ad_id, matched_model, title, price_str)
+                continue
+
             photo_obj = ad.get("photo") or {}
             img_url = photo_obj.get("url")
             full_url = urljoin(BASE_URL, raw_path)
-            views = ad.get("hits") or 0
             region = ad.get("region") or "Bakı"
 
             logger.info(f"YENİ SAHİBİNDƏN İPHONE: {matched_model} - {title} ({price_str}) | Satıcı: {seller_name}")
