@@ -43,7 +43,7 @@ def get_baku_now():
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8873977210:AAGayQLy11TeRvM-42ZTd_H254FbywjBtB4")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7998954235"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "acountnew1")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 PORT = int(os.getenv("PORT", "10000"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://tapaz-iphone-bot-1.onrender.com")
 
@@ -801,8 +801,8 @@ def check_tapaz_ads():
                 price_str = "Razılaşma ilə"
 
             views = ad.get("hits") or 0
-            # YALNIZ YENİ DÜŞMÜŞ ELANLAR (İstifadəçi tələbi: maksimum 15-20 baxış)
-            if views > 20:
+            # YALNIZ YENİ DÜŞMÜŞ TƏZƏ ELANLAR: Maksimum 15 baxış (0, 1, 2, 3, 5, ..., 15 baxış)
+            if views > 15:
                 mark_ad_seen(ad_id, matched_model, title, price_str)
                 continue
 
