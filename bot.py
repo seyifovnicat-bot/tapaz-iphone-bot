@@ -547,6 +547,7 @@ def handle_telegram_updates():
                             f"🔍 <b>Son Axtarış:</b> {BOT_STATS['last_check_at']}\n"
                             f"📱 <b>Son Elan:</b> {BOT_STATS['last_found_ad']}\n\n"
                             f"🛠 <b>Əmrlər:</b>\n"
+                            f"• /test və ya /yoxla (Canlı status)\n"
                             f"• <code>/qosh ID 3d</code> (3 günlük)\n"
                             f"• <code>/qosh ID 1m</code> (1 aylıq)\n"
                             f"• <code>/qosh ID 3m</code> (3 aylıq)\n"
@@ -556,6 +557,20 @@ def handle_telegram_updates():
                             f"• <code>/duyuru Mətn</code> (Kütləvi mesaj)"
                         )
                         send_telegram_msg(ADMIN_ID, admin_menu)
+
+                    elif text in ["/test", "test", "/yoxla", "yoxla", "/status"]:
+                        subs = get_active_subscribers()
+                        baku_current_str = baku_now_dt.strftime("%d.%m.%Y %H:%M:%S")
+                        test_reply = (
+                            f"⚡ <b>BOT HAZIRDIR VƏ İZLƏYİR!</b>\n\n"
+                            f"🕒 <b>Cari Bakı Vaxtı:</b> {baku_current_str}\n"
+                            f"📊 <b>Aktiv Abunəçilər:</b> {len(subs)} nəfər\n"
+                            f"🔄 <b>Ümumi Skan Sayı:</b> #{BOT_STATS['total_checks']}\n"
+                            f"⏱ <b>Son Skan:</b> {BOT_STATS['last_check_at']}\n"
+                            f"📱 <b>Son Elan:</b> {BOT_STATS['last_found_ad']}\n"
+                            f"🌐 <b>Canlı Panel:</b> {RENDER_EXTERNAL_URL}"
+                        )
+                        send_telegram_msg(ADMIN_ID, test_reply)
 
                     elif text.startswith("/qosh"):
                         parts = text.split()
@@ -676,73 +691,152 @@ def contains_blacklist(text):
                 return True
     return False
 
+class BrowserManager:
+    """Öz-özünü bərpa edən, sönməz Playwright brauzer idarəedicisi"""
+    def __init__(self):
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+
+    def start(self):
+        self.close()
+        try:
+            self.playwright = sync_playwright().start()
+            # Stabil, OOM-dən qorunan və çökməyən bayraqlar (təhlükəli --single-process çıxarıldı)
+            self.browser = self.playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-setuid-sandbox",
+                    "--no-first-run",
+                    "--no-zygote"
+                ]
+            )
+            self.context = self.browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800}
+            )
+            self.context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            self.page = self.context.new_page()
+
+            def block_media(route):
+                if route.request.resource_type in ["image", "media", "font"]:
+                    route.abort()
+                else:
+                    route.continue_()
+            self.page.route("**/*", block_media)
+            logger.info("Brauzer (Playwright Chromium) uğurla başladıldı və aktivdir.")
+        except Exception as e:
+            logger.error(f"Brauzer başladılarkən xəta: {e}")
+
+    def get_page(self):
+        try:
+            if self.page and not self.page.is_closed() and self.browser and self.browser.is_connected():
+                return self.page
+        except Exception:
+            pass
+        logger.warning("Brauzer qopuq və ya bağlıdır. Dərhal yenidən başladılır...")
+        self.start()
+        return self.page
+
+    def close(self):
+        for item in [self.page, self.context, self.browser, self.playwright]:
+            try:
+                if item:
+                    item.close() if hasattr(item, "close") else item.stop()
+            except Exception:
+                pass
+        self.page = self.context = self.browser = self.playwright = None
+
 def get_ad_details(page, ad_url):
+    html_content = None
     try:
-        # In-page fetch: resurs və RAM sərfiyyatı 0 MB, yeni tab açılmır, heç vaxt donmur!
         html_content = page.evaluate("""async (url) => {
             try {
-                const resp = await fetch(url);
-                if (!resp.ok) return null;
-                return await resp.text();
-            } catch(e) {
-                return null;
-            }
+                const resp = await fetch(url, { headers: { 'Accept': 'text/html' } });
+                if (resp.ok) return await resp.text();
+            } catch(e) {}
+            return null;
         }""", ad_url)
-
-        if not html_content:
-            logger.warning(f"Elan HTML-i alına bilmədi: {ad_url}")
-            return None
-
-        soup = BeautifulSoup(html_content, "html.parser")
-
-        # 1. İş saatları varmı? (Mağazadırsa iş saatı olur)
-        if soup.find(attrs={"data-testid": "author-info-working-schedule"}):
-            logger.info(f"Filtr: Mağaza iş qrafiki tapıldı ({ad_url})")
-            return None
-
-        # 2. Satıcı adı
-        author_elem = soup.find(attrs={"data-testid": "author-info-name"})
-        author_name = author_elem.text.strip() if author_elem else "Sahibi"
-        if contains_blacklist(author_name):
-            logger.info(f"Filtr: Satıcı adı qara siyahıdadır ({author_name}) ({ad_url})")
-            return None
-
-        # 3. Satıcının elan sayı (> 4 olarsa alverçi/mağaza sayılır)
-        author_link = soup.find(attrs={"data-testid": "author-info-link"})
-        if author_link:
-            count_match = re.search(r'(\d+)\s*elan', author_link.text.lower())
-            if count_match and int(count_match.group(1)) > 4:
-                logger.info(f"Filtr: Satıcının {count_match.group(1)} elanı var, alverçi/mağaza sayılır ({ad_url})")
-                return None
-
-        # 4. Təsvir mətni
-        desc_elem = soup.find("div", class_=lambda c: c and "DescriptionContainer" in c)
-        description = desc_elem.text.strip() if desc_elem else ""
-        if contains_blacklist(description):
-            logger.info(f"Filtr: Təsvirdə qara siyahı sözü tapıldı ({ad_url})")
-            return None
-
-        # 5. Şəkil
-        img_elem = soup.find("img", class_=lambda c: c and "SliderImage" in c) or soup.find("div", class_=lambda c: c and "SliderWrapper" in c)
-        img_url = None
-        if img_elem:
-            img_tag = img_elem if img_elem.name == "img" else img_elem.find("img")
-            if img_tag and img_tag.get("src"):
-                img_url = img_tag["src"]
-
-        return {
-            "author": author_name,
-            "description": description[:600],
-            "img_url": img_url
-        }
     except Exception as e:
-        logger.error(f"Elan detalları xətası ({ad_url}): {e}")
+        logger.warning(f"In-page fetch xətası ({ad_url}): {e}")
+
+    # Ehtiyat: Əgər in-page fetch cavab verməzsə, Python requests ilə sına
+    if not html_content:
+        try:
+            r = requests.get(
+                ad_url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                timeout=7
+            )
+            if r.status_code == 200:
+                html_content = r.text
+        except Exception:
+            pass
+
+    # Əgər detallar şəbəkə xətasına görə gəlmədisə, amma elan kartında 'Mağaza' YOXDURSA:
+    # Elanı İTİRMİRİK! Sahibkar elanı kimi qəbul edirik!
+    if not html_content:
+        logger.info(f"Detallar şəbəkədən oxunmadı, lakin mağaza olmadığı üçün elan qəbul edilir: {ad_url}")
+        return {
+            "author": "Sahibi (Şəxsi)",
+            "description": "Ətraflı məlumat üçün elan linkinə keçid edin.",
+            "img_url": None
+        }
+
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    # 1. İş saatları varmı? (Mağazadırsa iş saatı olur)
+    if soup.find(attrs={"data-testid": "author-info-working-schedule"}):
+        logger.info(f"Filtr: Mağaza iş qrafiki tapıldı ({ad_url})")
         return None
 
-def check_tapaz_ads(page):
+    # 2. Satıcı adı
+    author_elem = soup.find(attrs={"data-testid": "author-info-name"})
+    author_name = author_elem.text.strip() if author_elem else "Sahibi"
+    if contains_blacklist(author_name):
+        logger.info(f"Filtr: Satıcı adı qara siyahıdadır ({author_name}) ({ad_url})")
+        return None
+
+    # 3. Satıcının elan sayı (> 4 olarsa alverçi/mağaza sayılır)
+    author_link = soup.find(attrs={"data-testid": "author-info-link"})
+    if author_link:
+        count_match = re.search(r'(\d+)\s*elan', author_link.text.lower())
+        if count_match and int(count_match.group(1)) > 4:
+            logger.info(f"Filtr: Satıcının {count_match.group(1)} elanı var, alverçi/mağaza sayılır ({ad_url})")
+            return None
+
+    # 4. Təsvir mətni
+    desc_elem = soup.find("div", class_=lambda c: c and "DescriptionContainer" in c)
+    description = desc_elem.text.strip() if desc_elem else ""
+    if contains_blacklist(description):
+        logger.info(f"Filtr: Təsvirdə qara siyahı sözü tapıldı ({ad_url})")
+        return None
+
+    # 5. Şəkil
+    img_elem = soup.find("img", class_=lambda c: c and "SliderImage" in c) or soup.find("div", class_=lambda c: c and "SliderWrapper" in c)
+    img_url = None
+    if img_elem:
+        img_tag = img_elem if img_elem.name == "img" else img_elem.find("img")
+        if img_tag and img_tag.get("src"):
+            img_url = img_tag["src"]
+
+    return {
+        "author": author_name,
+        "description": description[:600],
+        "img_url": img_url
+    }
+
+def check_tapaz_ads(browser_mgr):
     BOT_STATS["last_check_at"] = get_baku_now().strftime("%d.%m.%Y %H:%M:%S")
     BOT_STATS["total_checks"] += 1
     logger.info(f"Tap.az canlı elanlar yoxlanılır (Dövr #{BOT_STATS['total_checks']})...")
+
+    page = browser_mgr.get_page()
 
     try:
         page.goto(TAPAZ_APPLE_URL, wait_until="domcontentloaded", timeout=30000)
@@ -782,6 +876,12 @@ def check_tapaz_ads(page):
             price_elem = card.find(attrs={"data-testid": "ad-card-price"})
             price = price_elem.text.strip() if price_elem else "Göstərilməyib"
 
+            # Şəkil kartdan götürülür
+            card_img = None
+            img_tag = card.find("img")
+            if img_tag and img_tag.get("src"):
+                card_img = img_tag["src"]
+
             full_url = urljoin(BASE_URL, href)
             logger.info(f"YENİ İPHONE: {matched_model} - {title} ({price}) | Şəxsi sahib yoxlanılır...")
 
@@ -796,9 +896,9 @@ def check_tapaz_ads(page):
                 "title": title,
                 "price": price,
                 "url": full_url,
-                "author": details["author"],
-                "description": details["description"],
-                "img_url": details["img_url"]
+                "author": details.get("author") or "Sahibi",
+                "description": details.get("description") or "",
+                "img_url": details.get("img_url") or card_img
             }
 
             broadcast_ad(ad_data)
@@ -806,7 +906,12 @@ def check_tapaz_ads(page):
             time.sleep(1)
 
     except Exception as e:
-        logger.error(f"Skanlama zamanı xəta: {e}")
+        err_msg = str(e)
+        logger.error(f"Skanlama zamanı xəta: {err_msg}")
+        # Əgər brauzer hər hansı səbəbdən qopubsa və ya bağlanıbsa, dərhal yenidən başladırıq!
+        if any(k in err_msg.lower() for k in ["closed", "target", "crash", "disconnected"]):
+            logger.warning("Brauzer xətası aşkarlandı, brauzer dərhal təzələnir...")
+            browser_mgr.start()
 
 # ==================== RENDER KEEP-ALIVE PINGER ====================
 def keep_render_alive():
@@ -821,6 +926,24 @@ def keep_render_alive():
 # ==================== WEB & DIAGNOSTICS SERVER ====================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == "/test_alert":
+            self.send_response(200)
+            self.send_header("Content-type", "text/html; charset=utf-8")
+            self.end_headers()
+            test_ad = {
+                "id": "manual_test_" + str(int(time.time())),
+                "model": "iPhone 15 Pro",
+                "title": "Apple iPhone 15 Pro Natural Titanium 128GB",
+                "price": "1 650 AZN",
+                "url": "https://tap.az",
+                "author": "Şəxsi Sahib",
+                "description": "Sınaq bildirişi: Bot 100% işləyir və hər skanda yeni elanları dərhal çatdırır.",
+                "img_url": None
+            }
+            broadcast_ad(test_ad)
+            self.wfile.write("<h3>✅ Test elanı Telegram-a uğurla göndərildi! Telegram botunuzu yoxlayın.</h3><a href='/'>Geri qayıt</a>".encode("utf-8"))
+            return
+
         self.send_response(200)
         self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
@@ -844,6 +967,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         .row {{ display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #21262d; }}
         .label {{ color: #8b949e; }}
         .val {{ font-weight: 600; color: #f0f6fc; }}
+        .btn {{ display: inline-block; background: #1f6feb; color: white; padding: 8px 16px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 13px; margin-top: 15px; text-align: center; }}
+        .btn:hover {{ background: #388bfd; }}
         .log-box {{ background: #010409; border: 1px solid #30363d; border-radius: 8px; padding: 12px; font-family: 'Consolas', 'Courier New', monospace; font-size: 12px; color: #7ee787; max-height: 250px; overflow-y: auto; white-space: pre-wrap; margin-top: 15px; }}
         .log-title {{ font-size: 13px; font-weight: bold; color: #8b949e; margin-top: 20px; margin-bottom: 5px; }}
     </style>
@@ -859,6 +984,10 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         <div class="row"><span class="label">Son Aşkarlanan Elan:</span><span class="val">{BOT_STATS['last_found_ad']}</span></div>
         <div class="row"><span class="label">Yoxlama İntervalı:</span><span class="val">{CHECK_INTERVAL} saniyə</span></div>
         
+        <div style="text-align: center;">
+            <a href="/test_alert" class="btn">📲 Telegram-a Canlı Sınaq Bildirişi Göndər</a>
+        </div>
+
         <div class="log-title">Canlı Sistem Jurnalı (Real-Time Logs):</div>
         <div class="log-box">{logs_formatted if logs_formatted else 'Jurnal hələ toplanır...'}</div>
     </div>
@@ -892,54 +1021,28 @@ def main():
     pinger_thread = threading.Thread(target=keep_render_alive, daemon=True)
     pinger_thread.start()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--single-process",
-                "--js-flags=--max-old-space-size=128",
-                "--disable-extensions",
-                "--disable-background-networking"
-            ]
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800}
-        )
-        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        page = context.new_page()
+    browser_mgr = BrowserManager()
+    browser_mgr.start()
 
-        # Resurs bloklama: RAM-ı minimumda saxlayır
-        def block_media(route):
-            if route.request.resource_type in ["image", "media", "font"]:
-                route.abort()
-            else:
-                route.continue_()
-        page.route("**/*", block_media)
+    cycle_count = 0
+    while True:
+        try:
+            check_tapaz_ads(browser_mgr)
+        except Exception as e:
+            logger.error(f"Əsas dövr xətası: {e}")
+            browser_mgr.start()
 
-        cycle_count = 0
-        while True:
+        cycle_count += 1
+        # Hər 30 skandan bir (~22 dəqiqə) yaddaşı tərtəmiz saxlamaq üçün brauzeri yenidən başladırıq
+        if cycle_count >= 30:
             try:
-                check_tapaz_ads(page)
-            except Exception as e:
-                logger.error(f"Əsas dövr xətası: {e}")
+                logger.info("Planlaşdırılmış yaddaş yenilənməsi (30 skan tamamlandı)...")
+                browser_mgr.start()
+                cycle_count = 0
+            except Exception:
+                pass
 
-            cycle_count += 1
-            if cycle_count >= 500:
-                try:
-                    logger.info("Brauzer yaddaşı yenilənir (Memory Optimization)...")
-                    page.close()
-                    page = context.new_page()
-                    page.route("**/*", block_media)
-                    cycle_count = 0
-                except Exception:
-                    pass
-
-            time.sleep(CHECK_INTERVAL)
+        time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
     main()
