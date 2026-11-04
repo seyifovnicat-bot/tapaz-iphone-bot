@@ -735,6 +735,7 @@ query SearchIphones($keywords: String, $first: Int!) {
       user {
         name
         isShop
+        publishedAdsCount
       }
     }
   }
@@ -765,10 +766,16 @@ def check_tapaz_ads():
         logger.info(f"GraphQL API-dən {len(ads)} ədəd canlı elan alındı.")
 
         for ad in reversed(ads):
-            # 1. Mağaza filtri: isShop True olanlar dərhal atılır (YALNIZ ŞƏXSİ SAHİB)
+            # 1. Mağaza filtri: isShop True olanlar dərhal atılır
             user_info = ad.get("user") or {}
             is_shop = user_info.get("isShop", False)
             if is_shop:
+                continue
+
+            # 2. ALVERÇİ FİLTRİ: İstifadəçi tələbi: Maksimum 2 elanı ola bilər!
+            # 2-dən çox elanı olanlar gizli alverçidir və qətiyyən buraxılmır!
+            published_count = user_info.get("publishedAdsCount") or 1
+            if published_count > 2:
                 continue
 
             raw_path = ad.get("path") or ""
@@ -811,7 +818,7 @@ def check_tapaz_ads():
             full_url = urljoin(BASE_URL, raw_path)
             region = ad.get("region") or "Bakı"
 
-            logger.info(f"YENİ SAHİBİNDƏN İPHONE: {matched_model} - {title} ({price_str}) | Satıcı: {seller_name}")
+            logger.info(f"YENİ SAHİBİNDƏN İPHONE: {matched_model} - {title} ({price_str}) | Satıcı: {seller_name} ({published_count} elanı)")
 
             ad_data = {
                 "id": ad_id,
@@ -819,8 +826,8 @@ def check_tapaz_ads():
                 "title": title,
                 "price": price_str,
                 "url": full_url,
-                "author": f"{seller_name} (Şəxsi Sahib)",
-                "description": f"📍 Şəhər: {region}\n👁 Baxış sayı: {views}",
+                "author": f"{seller_name} (Şəxsi Sahib - {published_count} elan)",
+                "description": f"📍 Şəhər: {region}\n👁 Baxış sayı: {views}\n📦 Satıcının ümumi elan sayı: {published_count} (Şəxsi)",
                 "img_url": img_url
             }
 
