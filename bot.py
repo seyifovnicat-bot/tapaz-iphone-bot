@@ -6,6 +6,7 @@ import html
 import logging
 import sqlite3
 import threading
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urljoin
@@ -16,11 +17,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+RECENT_LOGS = deque(maxlen=25)
+
+class RingLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            RECENT_LOGS.append(msg)
+        except Exception:
+            pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger("TapAzBot")
+ring_handler = RingLogHandler()
+ring_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(ring_handler)
 
 BAKU_TZ = timezone(timedelta(hours=4))
 
@@ -323,11 +337,13 @@ def broadcast_ad(ad):
     logger.info(f"Elan {len(subscribers)} aktiv abunəçiyə göndərilir: {ad['title']}")
     BOT_STATS["last_found_ad"] = f"{ad['model']} ({ad['price']}) - {get_baku_now().strftime('%H:%M:%S')}"
 
+    photo_caption = caption[:1020]
     for uid in subscribers:
         try:
+            sent = False
             if ad.get("img_url"):
-                send_telegram_photo(uid, ad["img_url"], caption)
-            else:
+                sent = send_telegram_photo(uid, ad["img_url"], photo_caption)
+            if not sent:
                 send_telegram_msg(uid, caption)
             time.sleep(0.05)
         except Exception as e:
@@ -652,47 +668,58 @@ def contains_blacklist(text):
         return False
     t = text.lower()
     for kw in BLACKLIST_KEYWORDS:
-        if kw in t:
-            return True
+        if len(kw) <= 4:
+            if re.search(r'\b' + re.escape(kw) + r'\b', t):
+                return True
+        else:
+            if kw in t:
+                return True
     return False
 
-def get_ad_details(context, ad_url):
-    det_page = None
+def get_ad_details(page, ad_url):
     try:
-        det_page = context.new_page()
-        # Resurs bloklama: RAM-ı 50MB-da saxlayır
-        def block_media(route):
-            if route.request.resource_type in ["image", "media", "font"]:
-                route.abort()
-            else:
-                route.continue_()
-        det_page.route("**/*", block_media)
+        # In-page fetch: resurs və RAM sərfiyyatı 0 MB, yeni tab açılmır, heç vaxt donmur!
+        html_content = page.evaluate("""async (url) => {
+            try {
+                const resp = await fetch(url);
+                if (!resp.ok) return null;
+                return await resp.text();
+            } catch(e) {
+                return null;
+            }
+        }""", ad_url)
 
-        det_page.goto(ad_url, wait_until="domcontentloaded", timeout=20000)
-        det_page.wait_for_timeout(1000)
-        soup = BeautifulSoup(det_page.content(), "html.parser")
+        if not html_content:
+            logger.warning(f"Elan HTML-i alına bilmədi: {ad_url}")
+            return None
 
-        # 1. İş saatları varmı?
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        # 1. İş saatları varmı? (Mağazadırsa iş saatı olur)
         if soup.find(attrs={"data-testid": "author-info-working-schedule"}):
+            logger.info(f"Filtr: Mağaza iş qrafiki tapıldı ({ad_url})")
             return None
 
         # 2. Satıcı adı
         author_elem = soup.find(attrs={"data-testid": "author-info-name"})
         author_name = author_elem.text.strip() if author_elem else "Sahibi"
         if contains_blacklist(author_name):
+            logger.info(f"Filtr: Satıcı adı qara siyahıdadır ({author_name}) ({ad_url})")
             return None
 
-        # 3. Satıcının elan sayı (> 4 olarsa alverçi sayılır)
+        # 3. Satıcının elan sayı (> 4 olarsa alverçi/mağaza sayılır)
         author_link = soup.find(attrs={"data-testid": "author-info-link"})
         if author_link:
             count_match = re.search(r'(\d+)\s*elan', author_link.text.lower())
             if count_match and int(count_match.group(1)) > 4:
+                logger.info(f"Filtr: Satıcının {count_match.group(1)} elanı var, alverçi/mağaza sayılır ({ad_url})")
                 return None
 
         # 4. Təsvir mətni
         desc_elem = soup.find("div", class_=lambda c: c and "DescriptionContainer" in c)
         description = desc_elem.text.strip() if desc_elem else ""
         if contains_blacklist(description):
+            logger.info(f"Filtr: Təsvirdə qara siyahı sözü tapıldı ({ad_url})")
             return None
 
         # 5. Şəkil
@@ -709,16 +736,10 @@ def get_ad_details(context, ad_url):
             "img_url": img_url
         }
     except Exception as e:
-        logger.error(f"Elan detalları xətası: {e}")
+        logger.error(f"Elan detalları xətası ({ad_url}): {e}")
         return None
-    finally:
-        if det_page:
-            try:
-                det_page.close()
-            except Exception:
-                pass
 
-def check_tapaz_ads(page, context):
+def check_tapaz_ads(page):
     BOT_STATS["last_check_at"] = get_baku_now().strftime("%d.%m.%Y %H:%M:%S")
     BOT_STATS["total_checks"] += 1
     logger.info(f"Tap.az canlı elanlar yoxlanılır (Dövr #{BOT_STATS['total_checks']})...")
@@ -764,7 +785,7 @@ def check_tapaz_ads(page, context):
             full_url = urljoin(BASE_URL, href)
             logger.info(f"YENİ İPHONE: {matched_model} - {title} ({price}) | Şəxsi sahib yoxlanılır...")
 
-            details = get_ad_details(context, full_url)
+            details = get_ad_details(page, full_url)
             if not details:
                 mark_ad_seen(ad_id, matched_model, title, price)
                 continue
@@ -807,37 +828,43 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         subs_count = len(get_active_subscribers())
         baku_time = get_baku_now().strftime("%d.%m.%Y %H:%M:%S")
 
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Tap.az iPhone SaaS Bot - Live Dashboard</title>
-            <meta charset="utf-8">
-            <meta http-equiv="refresh" content="30">
-            <style>
-                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; padding: 30px; }}
-                .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 24px; max-width: 600px; margin: 0 auto; }}
-                h1 {{ color: #58a6ff; font-size: 22px; margin-top: 0; }}
-                .badge {{ background: #238636; color: white; padding: 4px 10px; border-radius: 20px; font-weight: bold; font-size: 13px; }}
-                .row {{ display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #21262d; }}
-                .label {{ color: #8b949e; }}
-                .val {{ font-weight: 600; color: #f0f6fc; }}
-            </style>
-        </head>
-        <body>
-            <div class="card">
-                <h1>Tap.az iPhone Radar Bot <span class="badge">7/24 OYAQ</span></h1>
-                <div class="row"><span class="label">Status:</span><span class="val" style="color:#3fb950">Aktiv və İzləyir</span></div>
-                <div class="row"><span class="label">Cari Bakı Vaxtı:</span><span class="val">{baku_time}</span></div>
-                <div class="row"><span class="label">Son Skan Saatı:</span><span class="val">{BOT_STATS['last_check_at']}</span></div>
-                <div class="row"><span class="label">Ümumi Skan Sayı:</span><span class="val">#{BOT_STATS['total_checks']}</span></div>
-                <div class="row"><span class="label">Aktiv Abunəçilər:</span><span class="val">{subs_count} nəfər</span></div>
-                <div class="row"><span class="label">Son Aşkarlanan Elan:</span><span class="val">{BOT_STATS['last_found_ad']}</span></div>
-                <div class="row"><span class="label">Yoxlama İntervalı:</span><span class="val">{CHECK_INTERVAL} saniyə</span></div>
-            </div>
-        </body>
-        </html>
-        """
+        logs_formatted = "\n".join(html.escape(l) for l in list(RECENT_LOGS)[-20:])
+
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Tap.az iPhone SaaS Bot - Live Dashboard</title>
+    <meta charset="utf-8">
+    <meta http-equiv="refresh" content="15">
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; padding: 25px; }}
+        .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 24px; max-width: 700px; margin: 0 auto; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }}
+        h1 {{ color: #58a6ff; font-size: 22px; margin-top: 0; display: flex; align-items: center; justify-content: space-between; }}
+        .badge {{ background: #238636; color: white; padding: 4px 10px; border-radius: 20px; font-weight: bold; font-size: 13px; }}
+        .row {{ display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #21262d; }}
+        .label {{ color: #8b949e; }}
+        .val {{ font-weight: 600; color: #f0f6fc; }}
+        .log-box {{ background: #010409; border: 1px solid #30363d; border-radius: 8px; padding: 12px; font-family: 'Consolas', 'Courier New', monospace; font-size: 12px; color: #7ee787; max-height: 250px; overflow-y: auto; white-space: pre-wrap; margin-top: 15px; }}
+        .log-title {{ font-size: 13px; font-weight: bold; color: #8b949e; margin-top: 20px; margin-bottom: 5px; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Tap.az iPhone Radar Bot <span class="badge">7/24 OYAQ</span></h1>
+        <div class="row"><span class="label">Status:</span><span class="val" style="color:#3fb950">Aktiv və İzləyir</span></div>
+        <div class="row"><span class="label">Cari Bakı Vaxtı:</span><span class="val">{baku_time}</span></div>
+        <div class="row"><span class="label">Son Skan Saatı:</span><span class="val">{BOT_STATS['last_check_at']}</span></div>
+        <div class="row"><span class="label">Ümumi Skan Sayı:</span><span class="val">#{BOT_STATS['total_checks']}</span></div>
+        <div class="row"><span class="label">Aktiv Abunəçilər:</span><span class="val">{subs_count} nəfər</span></div>
+        <div class="row"><span class="label">Son Aşkarlanan Elan:</span><span class="val">{BOT_STATS['last_found_ad']}</span></div>
+        <div class="row"><span class="label">Yoxlama İntervalı:</span><span class="val">{CHECK_INTERVAL} saniyə</span></div>
+        
+        <div class="log-title">Canlı Sistem Jurnalı (Real-Time Logs):</div>
+        <div class="log-box">{logs_formatted if logs_formatted else 'Jurnal hələ toplanır...'}</div>
+    </div>
+</body>
+</html>
+"""
         self.wfile.write(html_content.encode("utf-8"))
 
     def log_message(self, format, *args):
@@ -872,7 +899,11 @@ def main():
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-gpu"
+                "--disable-gpu",
+                "--single-process",
+                "--js-flags=--max-old-space-size=128",
+                "--disable-extensions",
+                "--disable-background-networking"
             ]
         )
         context = browser.new_context(
@@ -882,7 +913,7 @@ def main():
         context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = context.new_page()
 
-        # Resurs bloklama: RAM-ı 60MB-da saxlayır, heç vaxt donmur
+        # Resurs bloklama: RAM-ı minimumda saxlayır
         def block_media(route):
             if route.request.resource_type in ["image", "media", "font"]:
                 route.abort()
@@ -893,7 +924,7 @@ def main():
         cycle_count = 0
         while True:
             try:
-                check_tapaz_ads(page, context)
+                check_tapaz_ads(page)
             except Exception as e:
                 logger.error(f"Əsas dövr xətası: {e}")
 
