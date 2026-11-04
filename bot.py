@@ -15,7 +15,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Loq konfiqurasiyası
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -32,11 +31,22 @@ def get_baku_now():
 # Telegram & Admin konfiqurasiyası
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8873977210:AAGayQLy11TeRvM-42ZTd_H254FbywjBtB4")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7998954235"))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60")) # 60 saniyə
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "45")) # 45 saniyə (sürətli və etibarlı)
 PORT = int(os.getenv("PORT", "10000"))
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://tapaz-iphone-bot-1.onrender.com")
 
-TAPAZ_APPLE_URL = "https://tap.az/elanlar/elektronika/telefonlar?p%5B749%5D=3855"
+# Real-vaxtda yeni düşən iPhone elanları linki (Ən son elanlar xronoloji ardıcıllıqla)
+TAPAZ_APPLE_URL = "https://tap.az/elanlar/elektronika/telefonlar?keywords=iphone"
 BASE_URL = "https://tap.az"
+
+# Global status statistikası
+BOT_STATS = {
+    "started_at": get_baku_now().strftime("%d.%m.%Y %H:%M:%S"),
+    "last_check_at": "Hələ yoxlanmayıb",
+    "total_checks": 0,
+    "last_found_ad": "Hələ tapılmayıb",
+    "status": "Aktiv"
+}
 
 BLACKLIST_KEYWORDS = [
     "mağaza", "magaza", "store", "shop", "şirkət", "sirket", "şəbəkə", "sebeke",
@@ -88,28 +98,21 @@ def init_db():
     add_or_update_user(ADMIN_ID, "Admin", "Admin", "Sahibkar (Limitsiz)", days=3650, is_active=1)
 
 def cleanup_old_database_records():
-    """
-    Sistemin illərlə donmadan, yüngül və sürətli işləməsi üçün
-    hər 24 saatdan bir köhnə elanları bazadan təmizləyir.
-    """
     try:
         conn = sqlite3.connect(DB_FILE)
         cur = conn.cursor()
-        # 3 gündən köhnə görülmüş elanları təmizlə
         cur.execute("DELETE FROM seen_ads WHERE created_at < datetime('now', '-3 days')")
         deleted_count = cur.rowcount
         conn.commit()
-        # Bazanı sıxlaşdırıb yaddaşı azad et (VACUUM)
         cur.execute("VACUUM")
         conn.close()
-        logger.info(f"Avtomatik 24-saatlıq təmizləmə: {deleted_count} köhnə qeyd silindi, baza optimallaşdırıldı.")
+        logger.info(f"Avtomatik 24-saatlıq təmizləmə: {deleted_count} köhnə qeyd silindi.")
     except Exception as e:
-        logger.error(f"Köhnə qeydlərin təmizlənməsində xəta: {e}")
+        logger.error(f"Təmizləmə xətası: {e}")
 
 def run_daily_cleaner():
-    """Hər 24 saatdan bir təmizləməni icra edən arxa plan prosesi"""
     while True:
-        time.sleep(86400) # 24 saat = 86400 saniyə
+        time.sleep(86400)
         cleanup_old_database_records()
 
 def is_ad_seen(ad_id):
@@ -261,7 +264,6 @@ def broadcast_ad(ad):
         logger.warning("Aktiv abunəçi tapılmadı!")
         return
 
-    # Xüsusi simvolları (<, >, &) təhlükəsiz et
     safe_model = html.escape(str(ad.get('model', 'iPhone')))
     safe_price = html.escape(str(ad.get('price', '')))
     safe_author = html.escape(str(ad.get('author', 'Sahibi')))
@@ -278,6 +280,8 @@ def broadcast_ad(ad):
     )
 
     logger.info(f"Elan {len(subscribers)} aktiv abunəçiyə göndərilir: {ad['title']}")
+    BOT_STATS["last_found_ad"] = f"{ad['model']} ({ad['price']}) - {get_baku_now().strftime('%H:%M:%S')}"
+
     for uid in subscribers:
         try:
             if ad.get("img_url"):
@@ -288,7 +292,7 @@ def broadcast_ad(ad):
         except Exception as e:
             logger.error(f"İstifadəçiyə ({uid}) göndərilə bilmədi: {e}")
 
-# ==================== TELEGRAM KOMANDALARI & TƏSDİQ SİSTEMİ ====================
+# ==================== TELEGRAM KOMANDALARI & TƏSDİQ ====================
 def handle_telegram_updates():
     offset = 0
     logger.info("Telegram komanda dinləyicisi işə düşdü...")
@@ -441,7 +445,8 @@ def handle_telegram_updates():
                             f"🕒 <b>Cari Bakı Vaxtı:</b> {baku_current_str}\n"
                             f"📊 <b>Aktiv Abunəçilər:</b> {len(subs)} nəfər\n"
                             f"⏱ <b>Yoxlama İntervalı:</b> {CHECK_INTERVAL} saniyə\n"
-                            f"🧹 <b>Avto-Təmizləmə:</b> 24 saatdan bir aktivdir\n\n"
+                            f"🔍 <b>Son Axtarış:</b> {BOT_STATS['last_check_at']}\n"
+                            f"📱 <b>Son Elan:</b> {BOT_STATS['last_found_ad']}\n\n"
                             f"🛠 <b>Əmrlər:</b>\n"
                             f"• <code>/qosh ID 3d</code> (3 günlük)\n"
                             f"• <code>/qosh ID 1m</code> (1 aylıq)\n"
@@ -530,7 +535,7 @@ def match_requested_model(title):
     if "pro max" in t or "promax" in t or "plus" in t or "mini" in t:
         return None
 
-    # iPhone 16 — YALNIZ sadə
+    # iPhone 16 — YALNIZ sadə model (Pro/Pro Max qadağandır)
     if re.search(r'\b16\b', t):
         if "pro" in t:
             return None
@@ -569,7 +574,6 @@ def contains_blacklist(text):
     return False
 
 def get_ad_details(context, ad_url):
-    """Detalları ayrıca təmiz tabda yoxlayır və dərhal bağlayır"""
     det_page = None
     try:
         det_page = context.new_page()
@@ -577,7 +581,7 @@ def get_ad_details(context, ad_url):
         det_page.wait_for_timeout(1500)
         soup = BeautifulSoup(det_page.content(), "html.parser")
 
-        # 1. İş saatları varmı?
+        # 1. İş saatları varmı? (Mağazadır)
         if soup.find(attrs={"data-testid": "author-info-working-schedule"}):
             return None
 
@@ -624,15 +628,19 @@ def get_ad_details(context, ad_url):
                 pass
 
 def check_tapaz_ads(page, context):
-    logger.info("Tap.az yoxlanılır (Bakı vaxtı ilə)...")
+    BOT_STATS["last_check_at"] = get_baku_now().strftime("%d.%m.%Y %H:%M:%S")
+    BOT_STATS["total_checks"] += 1
+    logger.info(f"Tap.az canlı elanlar yoxlanılır (Dövr #{BOT_STATS['total_checks']})...")
+
     try:
         page.goto(TAPAZ_APPLE_URL, wait_until="domcontentloaded", timeout=35000)
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(2500)
 
         soup = BeautifulSoup(page.content(), "html.parser")
-        latest_section = soup.find(attrs={"data-testid": "latest-ads-section"})
-        cards = latest_section.find_all(attrs={"data-testid": "ad-card"}) if latest_section else soup.find_all(attrs={"data-testid": "ad-card"})
+        cards = soup.find_all(attrs={"data-testid": "ad-card"})
+        logger.info(f"Saytda {len(cards)} ədəd elan kartı aşkarlandı.")
 
+        # Xronoloji ardıcıllıq üçün tərsinə (ən köhnədən ən yeniyə)
         for card in reversed(cards):
             if card.find(string=lambda t: t and "Mağaza" in t):
                 continue
@@ -661,7 +669,7 @@ def check_tapaz_ads(page, context):
             price = price_elem.text.strip() if price_elem else "Göstərilməyib"
 
             full_url = urljoin(BASE_URL, href)
-            logger.info(f"Uyğun model tapıldı: {matched_model} - {title} ({price}) | Yoxlanılır...")
+            logger.info(f"YENİ İPHONE: {matched_model} - {title} ({price}) | Şəxsi sahib yoxlanılır...")
 
             details = get_ad_details(context, full_url)
             if not details:
@@ -686,25 +694,77 @@ def check_tapaz_ads(page, context):
     except Exception as e:
         logger.error(f"Skanlama zamanı xəta: {e}")
 
+# ==================== RENDER KEEP-ALIVE PINGER ====================
+def keep_render_alive():
+    """
+    Render Free xidmətləri 15 dəqiqə sorğu gəlmədikdə yuxuya gedir.
+    Bu funksiya hər 6 dəqiqədən bir öz veb ünvanına HTTP sorğu ataraq
+    serveri 7/24 100% OYAQ saxlayır.
+    """
+    time.sleep(60) # Başlanğıc üçün 1 dəqiqə gözlə
+    while True:
+        try:
+            res = requests.get(RENDER_EXTERNAL_URL, timeout=20)
+            logger.info(f"Render Oyaq-Saxlama P Current Status: {res.status_code}")
+        except Exception as e:
+            logger.warning(f"Keep-alive xətası: {e}")
+        time.sleep(360) # Hər 6 dəqiqədən bir (15 dəqiqə dolmadan)
+
+# ==================== WEB & DIAGNOSTICS SERVER ====================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Tap.az iPhone SaaS Bot 7/24 Aktivdir!")
+
+        subs_count = len(get_active_subscribers())
+        baku_time = get_baku_now().strftime("%d.%m.%Y %H:%M:%S")
+
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Tap.az iPhone SaaS Bot - Live Dashboard</title>
+            <meta charset="utf-8">
+            <meta http-equiv="refresh" content="30">
+            <style>
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #0d1117; color: #c9d1d9; padding: 30px; }}
+                .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 24px; max-width: 600px; margin: 0 auto; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }}
+                h1 {{ color: #58a6ff; font-size: 22px; margin-top: 0; }}
+                .badge {{ background: #238636; color: white; padding: 4px 10px; border-radius: 20px; font-weight: bold; font-size: 13px; }}
+                .row {{ display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #21262d; }}
+                .label {{ color: #8b949e; }}
+                .val {{ font-weight: 600; color: #f0f6fc; }}
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <h1>Tap.az iPhone Radar Bot <span class="badge">7/24 OYAQ</span></h1>
+                <div class="row"><span class="label">Status:</span><span class="val" style="color:#3fb950">Aktiv və İzləyir</span></div>
+                <div class="row"><span class="label">Cari Bakı Vaxtı:</span><span class="val">{baku_time}</span></div>
+                <div class="row"><span class="label">Son Skan Saatı:</span><span class="val">{BOT_STATS['last_check_at']}</span></div>
+                <div class="row"><span class="label">Ümumi Skan Sayı:</span><span class="val">#{BOT_STATS['total_checks']}</span></div>
+                <div class="row"><span class="label">Aktiv Abunəçilər:</span><span class="val">{subs_count} nəfər</span></div>
+                <div class="row"><span class="label">Son Aşkarlanan Elan:</span><span class="val">{BOT_STATS['last_found_ad']}</span></div>
+                <div class="row"><span class="label">Yoxlama İntervalı:</span><span class="val">{CHECK_INTERVAL} saniyə</span></div>
+            </div>
+        </body>
+        </html>
+        """
+        self.wfile.write(html_content.encode("utf-8"))
 
     def log_message(self, format, *args):
         return
 
 def run_web_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-    logger.info(f"Veb server {PORT} portunda işə salındı.")
+    logger.info(f"Diaqnostika veb serveri {PORT} portunda işə salındı.")
     server.serve_forever()
 
 def main():
     init_db()
     now_baku = get_baku_now().strftime("%d.%m.%Y %H:%M:%S")
-    logger.info(f"Tap.az iPhone SaaS Bot Başladı (Bakı vaxtı: {now_baku}, İnterval: 60s)...")
+    logger.info(f"Tap.az iPhone SaaS Bot Başladı (Bakı: {now_baku}, İnterval: {CHECK_INTERVAL}s)...")
 
     # 1. Render üçün Health Server
     server_thread = threading.Thread(target=run_web_server, daemon=True)
@@ -714,11 +774,15 @@ def main():
     updates_thread = threading.Thread(target=handle_telegram_updates, daemon=True)
     updates_thread.start()
 
-    # 3. Hər 24 saatdan bir köhnə elanları təmizləyən avto-mexanizm
+    # 3. Hər 24 saatdan bir köhnə elanları təmizləyən arxa plan
     cleaner_thread = threading.Thread(target=run_daily_cleaner, daemon=True)
     cleaner_thread.start()
 
-    # 4. Playwright Skraper
+    # 4. Render-in yuxuya getməməsi üçün Keep-Alive Pinger
+    pinger_thread = threading.Thread(target=keep_render_alive, daemon=True)
+    pinger_thread.start()
+
+    # 5. Playwright Skraper
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -744,7 +808,6 @@ def main():
                 logger.error(f"Əsas dövr xətası: {e}")
 
             cycle_count += 1
-            # Hər 500 dövrdən bir (təqribən 8 saatda bir) Chromium brauzer yaddaşını sıfırla ki, RAM heç vaxt dolmasın
             if cycle_count >= 500:
                 try:
                     logger.info("Brauzer yaddaşı yenilənir (Memory Optimization)...")
